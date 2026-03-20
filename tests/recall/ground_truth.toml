@@ -1,0 +1,417 @@
+# Engram Recall Ground Truth
+#
+# 27 test queries with expected memory IDs, expected search method,
+# and scoring thresholds.
+#
+# Fields per query:
+#   id              - unique query identifier for reporting
+#   query           - the search string passed to engram_recall
+#   category        - A/B/C/D/E/F from the test matrix
+#   method          - "semantic", "fulltext", or "hybrid"
+#   relevant_ids    - memory IDs that count as correct results (ordered by relevance)
+#   max_rank        - the relevant result must appear within this rank position
+#   filters         - optional: memory_types, tags, project
+#   expect_empty    - if true, result set must be empty
+
+# ---------------------------------------------------------------------------
+# CATEGORY A: Basic Search Quality
+# ---------------------------------------------------------------------------
+
+[[queries]]
+id = "A01"
+description = "Exact phrase in content"
+query = "DATABASE_URL configuration"
+category = "A"
+method = "fulltext"
+relevant_ids = ["00000000-0000-0000-0000-000000000016"]
+max_rank = 1
+# DATABASE_URL appears verbatim; FTS trivially wins
+
+[[queries]]
+id = "A02"
+description = "Exact phrase in content - CORS error variable name"
+query = "CORS_ALLOWED_ORIGINS error"
+category = "A"
+method = "fulltext"
+relevant_ids = ["00000000-0000-0000-0000-000000000008"]
+max_rank = 1
+
+[[queries]]
+id = "A03"
+description = "Semantic - authentication mechanism intent"
+query = "how does authentication work"
+category = "A"
+method = "semantic"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000004",  # JWT decision
+  "00000000-0000-0000-0000-000000000030",  # auth middleware code context
+  "00000000-0000-0000-0000-000000000012",  # JWT expiry bug
+]
+max_rank = 3
+
+[[queries]]
+id = "A04"
+description = "Partial match - billing synonyms"
+query = "billing payment processing decision"
+category = "A"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000002",  # Stripe decision
+  "00000000-0000-0000-0000-000000000017",  # payment pipeline guideline
+  "00000000-0000-0000-0000-000000000015",  # feature flags for payments
+]
+max_rank = 5
+
+[[queries]]
+id = "A05"
+description = "No results - topic never stored"
+query = "kubernetes helm chart deployment configuration"
+category = "A"
+method = "hybrid"
+relevant_ids = []
+expect_empty = false  # May return weak semantic matches; we don't assert empty, just no high-confidence hits
+max_rank = 999
+min_score_threshold = 0.7  # No result should have score >= 0.7 (used by harness to flag false positives)
+
+[[queries]]
+id = "A06"
+description = "Partial keyword - 'billing' substring appears in many memories"
+query = "billing"
+category = "A"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000001",
+  "00000000-0000-0000-0000-000000000002",
+  "00000000-0000-0000-0000-000000000003",
+  "00000000-0000-0000-0000-000000000013",
+]
+max_rank = 5
+
+# ---------------------------------------------------------------------------
+# CATEGORY B: Hybrid Search Effectiveness
+# ---------------------------------------------------------------------------
+
+[[queries]]
+id = "B01"
+description = "Semantic wins - intent-based, no matching keywords"
+query = "why is the API slow"
+category = "B"
+method = "semantic"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000010",  # PgBouncer (DB pool -> slowness)
+  "00000000-0000-0000-0000-000000000011",  # N+1 query
+  "00000000-0000-0000-0000-000000000005",  # Redis caching decision (perf)
+  "00000000-0000-0000-0000-000000000023",  # async queue latency outcome
+]
+max_rank = 5
+
+[[queries]]
+id = "B02"
+description = "Full-text wins - exact error term"
+query = "CORS_ALLOWED_ORIGINS"
+category = "B"
+method = "fulltext"
+relevant_ids = ["00000000-0000-0000-0000-000000000008"]
+max_rank = 1
+
+[[queries]]
+id = "B03"
+description = "Full-text wins - exact config var"
+query = "BRAINTREE_MERCHANT_ID"
+category = "B"
+method = "fulltext"
+relevant_ids = []
+expect_empty = true  # Memory 41 is expired, must not appear
+
+[[queries]]
+id = "B04"
+description = "Hybrid - Redis cache timeout pattern"
+query = "Redis cache timeout pattern"
+category = "B"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000022",  # Redis 50ms timeout pattern
+  "00000000-0000-0000-0000-000000000007",  # Redis connection timeout error
+  "00000000-0000-0000-0000-000000000005",  # Redis cache decision
+]
+max_rank = 3
+
+[[queries]]
+id = "B05"
+description = "Deduplication - same memory must appear once even if both methods match"
+query = "Redis connection pool exhausted timeout"
+category = "B"
+method = "hybrid"
+relevant_ids = ["00000000-0000-0000-0000-000000000007"]
+max_rank = 1
+assert_no_duplicate_ids = true
+
+[[queries]]
+id = "B06"
+description = "Full-text only - null embedding memory must be retrievable"
+query = "grpc_health_v1 proto health check"
+category = "B"
+method = "fulltext"
+relevant_ids = ["00000000-0000-0000-0000-000000000042"]
+max_rank = 3
+# Memory 42 has null_embedding so semantic search cannot find it; FTS must carry it
+
+# ---------------------------------------------------------------------------
+# CATEGORY C: Filtering
+# ---------------------------------------------------------------------------
+
+[[queries]]
+id = "C01"
+description = "Filter by memory_type=decision"
+query = "database choice"
+category = "C"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000001",  # PostgreSQL decision
+  "00000000-0000-0000-0000-000000000005",  # Redis decision
+]
+max_rank = 3
+filters = { memory_types = ["decision"] }
+# Guideline 13 (transactions) is about database but is a guideline - must not appear
+
+[[queries]]
+id = "C02"
+description = "Filter by memory_type=error_pattern"
+query = "connection problems"
+category = "C"
+method = "semantic"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000007",  # Redis connection timeout
+  "00000000-0000-0000-0000-000000000010",  # PgBouncer connection exhaustion
+]
+max_rank = 3
+filters = { memory_types = ["error_pattern"] }
+
+[[queries]]
+id = "C03"
+description = "Filter by tag"
+query = "payment processing"
+category = "C"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000002",  # Stripe decision
+  "00000000-0000-0000-0000-000000000026",  # payment outage incident
+]
+max_rank = 3
+filters = { tags = ["stripe"] }
+
+[[queries]]
+id = "C04"
+description = "Filter by project scope"
+query = "performance optimization"
+category = "C"
+method = "semantic"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000011",  # N+1 query (billing-service)
+  "00000000-0000-0000-0000-000000000010",  # PgBouncer (billing-service)
+  "00000000-0000-0000-0000-000000000023",  # async queue outcome (billing-service)
+  "00000000-0000-0000-0000-000000000025",  # Redis caching outcome (billing-service)
+]
+max_rank = 5
+filters = { project = "billing-service" }
+
+[[queries]]
+id = "C05"
+description = "Combined filter - type + tag"
+query = "service outage"
+category = "C"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000026",  # payment outage
+  "00000000-0000-0000-0000-000000000027",  # API 502 outage
+  "00000000-0000-0000-0000-000000000028",  # billing data incident
+]
+max_rank = 3
+filters = { memory_types = ["incident"] }
+
+[[queries]]
+id = "C06"
+description = "Filter produces empty result set - valid filter, no matching content"
+query = "kubernetes"
+category = "C"
+method = "hybrid"
+relevant_ids = []
+expect_empty = true
+filters = { memory_types = ["incident"] }
+
+[[queries]]
+id = "C07"
+description = "Filter by multiple memory_types"
+query = "database"
+category = "C"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000001",  # PostgreSQL decision
+  "00000000-0000-0000-0000-000000000010",  # PgBouncer error_pattern
+]
+max_rank = 5
+filters = { memory_types = ["decision", "error_pattern"] }
+
+# ---------------------------------------------------------------------------
+# CATEGORY D: Edge Cases
+# ---------------------------------------------------------------------------
+
+[[queries]]
+id = "D01"
+description = "Very short query - single token"
+query = "auth"
+category = "D"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000004",  # JWT decision
+  "00000000-0000-0000-0000-000000000030",  # auth middleware
+  "00000000-0000-0000-0000-000000000012",  # JWT expiry bug
+]
+max_rank = 5
+
+[[queries]]
+id = "D02"
+description = "Very long query - paragraph describing a problem"
+query = "We are seeing a lot of 502 errors in the API gateway. The errors started after we deployed a new version. Redis seems to be involved based on the error logs. We think it might be a memory issue because the logs show OOM killer activity. What do we know about this?"
+category = "D"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000027",  # Redis OOM incident
+  "00000000-0000-0000-0000-000000000022",  # Redis timeout pattern
+  "00000000-0000-0000-0000-000000000007",  # Redis connection timeout
+]
+max_rank = 5
+
+[[queries]]
+id = "D03"
+description = "Special characters in query - should not error"
+query = "error: connection refused (os error 111)"
+category = "D"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000007",  # Redis connection timeout
+  "00000000-0000-0000-0000-000000000010",  # PgBouncer exhaustion
+]
+max_rank = 5
+assert_no_error = true
+
+[[queries]]
+id = "D04"
+description = "Expired memory must not appear"
+query = "Braintree payment processor BRAINTREE_MERCHANT_ID"
+category = "D"
+method = "hybrid"
+relevant_ids = []
+expect_empty = true
+# Memory 41 is the only match and it is expired; result must be empty
+
+[[queries]]
+id = "D05"
+description = "Query in different language - Spanish, stored memories are English"
+query = "procesamiento de pagos con tarjeta de credito"
+category = "D"
+method = "semantic"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000002",  # Stripe (semantic may bridge)
+]
+max_rank = 10
+# Cross-lingual semantic recall is weak with MiniLM; max_rank is lenient
+
+[[queries]]
+id = "D06"
+description = "Null embedding memory found by full-text path"
+query = "health check port 50051"
+category = "D"
+method = "fulltext"
+relevant_ids = ["00000000-0000-0000-0000-000000000042"]
+max_rank = 3
+
+# ---------------------------------------------------------------------------
+# CATEGORY E: Ranking Quality
+# ---------------------------------------------------------------------------
+
+[[queries]]
+id = "E01"
+description = "Higher importance should rank first - both memories about PostgreSQL"
+query = "PostgreSQL database"
+category = "E"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000001",  # importance=0.9 (PostgreSQL decision)
+  "00000000-0000-0000-0000-000000000039",  # importance=0.2 (version note)
+]
+max_rank = 5
+assert_rank_order = [
+  "00000000-0000-0000-0000-000000000001",
+  "00000000-0000-0000-0000-000000000039",
+]
+# ID 001 must rank above ID 039
+
+[[queries]]
+id = "E02"
+description = "Exact keyword match outranks vague semantic match"
+query = "HNSW index ef_construction"
+category = "E"
+method = "fulltext"
+relevant_ids = ["00000000-0000-0000-0000-000000000024"]
+max_rank = 1
+# The HNSW outcome memory contains the exact tokens; should be rank 1
+
+[[queries]]
+id = "E03"
+description = "Multiple relevant memories returned in meaningful order"
+query = "incident outage root cause fix"
+category = "E"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000026",  # payment outage incident
+  "00000000-0000-0000-0000-000000000027",  # API 502 incident
+  "00000000-0000-0000-0000-000000000028",  # billing data incident
+]
+max_rank = 5
+
+[[queries]]
+id = "E04"
+description = "Most recent relevant memory should rank higher than older one when semantic score is similar"
+query = "billing data corruption consistency problem"
+category = "E"
+method = "semantic"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000028",  # 29 days ago - race condition
+  "00000000-0000-0000-0000-000000000003",  # 120 days ago - transaction decision
+]
+max_rank = 5
+# ID 028 is more recent; when scores are close it should rank above ID 003
+
+# ---------------------------------------------------------------------------
+# CATEGORY F: Performance
+# (Latency assertions - actual timing is done in the harness, not here)
+# ---------------------------------------------------------------------------
+
+[[queries]]
+id = "F01"
+description = "Latency baseline - simple query against seed dataset (~42 memories)"
+query = "authentication JWT session"
+category = "F"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000004",
+  "00000000-0000-0000-0000-000000000012",
+  "00000000-0000-0000-0000-000000000030",
+]
+max_rank = 3
+latency_budget_ms = 50
+
+[[queries]]
+id = "F02"
+description = "Latency with type filter - should be faster than full scan"
+query = "database connection performance"
+category = "F"
+method = "hybrid"
+relevant_ids = [
+  "00000000-0000-0000-0000-000000000010",
+  "00000000-0000-0000-0000-000000000007",
+]
+max_rank = 3
+filters = { memory_types = ["error_pattern"] }
+latency_budget_ms = 50

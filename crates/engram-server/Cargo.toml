@@ -1,0 +1,20 @@
+[package]
+name = "engram-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "engram-mcp"
+path = "src/main.rs"
+
+[dependencies]
+engram-core = { path = "../engram-core" }
+rmcp = { version = "1.2", features = ["server", "transport-io"] }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,3 @@
+# Ignore cloned test repos (large), keep ground truth TOML files
+*/*
+!*/ground-truth.toml

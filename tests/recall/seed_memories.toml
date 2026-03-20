@@ -1,0 +1,557 @@
+# Engram Recall Test - Seed Memories
+#
+# 40 realistic memories across two fictional projects (billing-service, api-gateway)
+# plus org-wide guidelines. Covers all MemoryType variants and edge cases.
+#
+# IDs are stable UUIDs so ground-truth queries can reference them directly.
+# importance ranges: low=0.3, medium=0.5, high=0.7, critical=0.9
+
+# ---------------------------------------------------------------------------
+# DECISIONS - billing-service
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000001"
+content = "Chose PostgreSQL over MongoDB because our query patterns are relational and we need ACID transactions. MongoDB was evaluated but rejected due to lack of multi-document transaction support in versions available at the time."
+summary = "PostgreSQL chosen over MongoDB for ACID transactions"
+memory_type = "decision"
+tags = ["database", "postgresql", "mongodb", "architecture"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 180
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000002"
+content = "Chose Stripe as the payment processor over Braintree and Adyen. Stripe has better developer experience, webhook reliability, and native support for subscription billing. Integration cost was lower."
+summary = "Stripe chosen as payment processor"
+memory_type = "decision"
+tags = ["payments", "stripe", "billing", "third-party"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 150
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000003"
+content = "Decided to use database transactions when updating both user and billing tables simultaneously. Any failure in billing must roll back the user record change to prevent orphaned billing state."
+summary = "Use transactions for user+billing dual writes"
+memory_type = "decision"
+tags = ["transactions", "database", "consistency", "billing"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 120
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000004"
+content = "Chose JWT tokens for session management instead of server-side sessions. Reasoning: stateless auth scales horizontally without shared session store. Tokens expire after 24 hours. Refresh tokens stored in httpOnly cookies."
+summary = "JWT chosen for stateless session management"
+memory_type = "decision"
+tags = ["auth", "jwt", "sessions", "security"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 200
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000005"
+content = "Decided to use Redis for caching API responses. Cache TTL set to 60 seconds for user profile data, 300 seconds for catalog data. Cache-aside pattern used throughout. Redis runs as a single node for now."
+summary = "Redis cache-aside for API response caching"
+memory_type = "decision"
+tags = ["redis", "cache", "performance", "api"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 160
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000006"
+content = "Adopted event sourcing for the billing domain. All billing state changes are recorded as immutable events. This enables audit trails, replays, and temporal queries. The current aggregate is rebuilt by replaying events on read."
+summary = "Event sourcing adopted for billing domain"
+memory_type = "architecture"
+tags = ["event-sourcing", "cqrs", "billing", "architecture"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 90
+
+# ---------------------------------------------------------------------------
+# ERROR PATTERNS
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000007"
+content = "Redis connection timeout errors caused by exceeding max connections. Symptom: connection pool exhausted under load. Fix: increase maxclients to 10000 in redis.conf and set pool size in the application to max_connections/2."
+summary = "Redis max connections causing timeout under load"
+memory_type = "error_pattern"
+tags = ["redis", "timeout", "connection-pool", "performance"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 45
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000008"
+content = "CORS_ALLOWED_ORIGINS misconfiguration caused 403 errors on preflight OPTIONS requests from the mobile app. The environment variable was set to the production domain but not the staging domain. Fix: use a comma-separated list. Add staging.acme.com to CORS_ALLOWED_ORIGINS."
+summary = "CORS_ALLOWED_ORIGINS missing staging domain caused 403s"
+memory_type = "error_pattern"
+tags = ["cors", "security", "configuration", "environment"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 30
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000009"
+content = "Stripe webhook signature verification was failing intermittently. Root cause: webhook handler was reading request body twice - once for signature check and once for JSON parsing. Body stream was exhausted. Fix: buffer the raw body before parsing."
+summary = "Stripe webhook body read twice caused signature failure"
+memory_type = "error_pattern"
+tags = ["stripe", "webhook", "http", "bug"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 60
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000010"
+content = "Database connection pool exhaustion under high load. PostgreSQL max_connections was 100 and the application was opening a connection per request. Fix: switched to PgBouncer connection pooling. Now maintain a pool of 20 connections serving 500 concurrent requests."
+summary = "PgBouncer added to handle connection pool exhaustion"
+memory_type = "error_pattern"
+tags = ["postgresql", "pgbouncer", "connection-pool", "performance", "database"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 75
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000011"
+content = "N+1 query problem in the invoice listing endpoint. Each invoice was loading its line items in a separate query. Fix: join line items in the initial query using LEFT JOIN. Reduced latency from 800ms to 12ms for a list of 50 invoices."
+summary = "N+1 query in invoice listing fixed with JOIN"
+memory_type = "error_pattern"
+tags = ["performance", "sql", "n+1", "database", "invoice"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 40
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000012"
+content = "JWT token expiry was not being checked on the mobile app. A user could continue using an expired token if they never restarted the app. Fix: added client-side expiry check on each request and force re-authentication when exp claim is in the past."
+summary = "Mobile app not checking JWT expiry on each request"
+memory_type = "error_pattern"
+tags = ["jwt", "auth", "mobile", "security", "bug"]
+project = "api-gateway"
+team = "mobile"
+organization = "acme"
+importance = 0.8
+created_days_ago = 20
+
+# ---------------------------------------------------------------------------
+# GUIDELINES - org-wide
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000013"
+content = "Always use database transactions when updating both user and billing tables. Never update one without wrapping both in a transaction. This prevents orphaned billing state when the user update fails after a billing record is written."
+summary = "Guideline: wrap user+billing updates in transactions"
+memory_type = "guideline"
+tags = ["transactions", "database", "billing", "best-practice"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 100
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000014"
+content = "All API endpoints must validate and sanitize input before processing. Use the shared validation middleware. Never trust client-provided IDs without verifying ownership. Rate limit all public endpoints."
+summary = "API input validation and rate limiting required"
+memory_type = "guideline"
+tags = ["security", "api", "validation", "rate-limiting"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 300
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000015"
+content = "Feature flags must be used for any change that affects the payment flow. Never deploy payment changes directly to production. Use the LaunchDarkly feature flag to gate the new code path and roll out incrementally."
+summary = "Feature flags required for payment flow changes"
+memory_type = "guideline"
+tags = ["feature-flags", "payments", "deployment", "launchdarkly"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 120
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000016"
+content = "DATABASE_URL must be set via environment variable, never hardcoded. Use the DATABASE_URL configuration pattern. Connection strings must not appear in source code or logs. Rotate credentials quarterly."
+summary = "DATABASE_URL via env var, never hardcoded"
+memory_type = "guideline"
+tags = ["configuration", "security", "database", "secrets"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 250
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000017"
+content = "All payment processing must go through the payment pipeline. Direct calls to Stripe are forbidden outside the billing-service. Any new payment method must be implemented as a payment processor adapter."
+summary = "All payments must go through payment pipeline adapter"
+memory_type = "guideline"
+tags = ["payments", "architecture", "billing", "stripe"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 130
+
+# ---------------------------------------------------------------------------
+# PATTERNS - reusable engineering patterns
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000018"
+content = "Cache-aside pattern used for all read-heavy data. Read from cache first; on miss, read from database and populate cache. Write-through is not used because it complicates the write path and cache invalidation is handled by TTL."
+summary = "Cache-aside pattern for read-heavy data"
+memory_type = "pattern"
+tags = ["cache", "redis", "pattern", "performance"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.6
+created_days_ago = 140
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000019"
+content = "Idempotency keys are required on all payment creation endpoints. The key is stored in the database and duplicate requests with the same key return the original response. Key format: UUID v4 provided by the client."
+summary = "Idempotency keys required for payment creation"
+memory_type = "pattern"
+tags = ["idempotency", "payments", "api", "reliability"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 95
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000020"
+content = "Retry with exponential backoff applied to all outbound HTTP calls to third-party services. Base delay 1 second, max 5 retries, max delay 30 seconds. Jitter added to prevent thundering herd. Non-retryable errors (4xx) are not retried."
+summary = "Exponential backoff with jitter for third-party calls"
+memory_type = "pattern"
+tags = ["retry", "resilience", "http", "third-party", "exponential-backoff"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 80
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000021"
+content = "Dead letter queue pattern for failed webhook processing. Webhooks that fail after 3 retries are moved to a DLQ. An alert fires when DLQ depth exceeds 10. Manual review and replay is required for DLQ messages."
+summary = "DLQ for failed webhook processing after 3 retries"
+memory_type = "pattern"
+tags = ["webhook", "dlq", "reliability", "queue", "alerting"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 55
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000022"
+content = "Redis cache timeout pattern: all cache operations have a 50ms timeout. If Redis is unavailable or slow, fall back to the database. Never let a cache outage cause an API outage. Set socket timeout and connect timeout both to 50ms."
+summary = "50ms Redis timeout with database fallback"
+memory_type = "pattern"
+tags = ["redis", "timeout", "resilience", "cache", "fallback"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 70
+
+# ---------------------------------------------------------------------------
+# OUTCOMES - post-mortems and results
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000023"
+content = "Migrating from synchronous payment processing to async queue improved checkout latency from 3.2 seconds to 180ms at the 95th percentile. The Stripe API call is now handled by a background worker. Customer-visible success rate increased from 94% to 99.1%."
+summary = "Async payment queue reduced p95 latency from 3.2s to 180ms"
+memory_type = "outcome"
+tags = ["performance", "async", "queue", "billing", "latency"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 50
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000024"
+content = "Adding HNSW index to the embedding column reduced vector similarity search from 2.1 seconds to 8ms at p99 with 500k rows. Index parameters: m=16, ef_construction=64. ef_search set to 40 at query time."
+summary = "HNSW index reduced vector search from 2.1s to 8ms"
+memory_type = "outcome"
+tags = ["pgvector", "hnsw", "performance", "search", "index"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 35
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000025"
+content = "Caching the subscription status lookup in Redis reduced database load by 78%. Before caching, subscription status was queried on every API request. After caching with 60-second TTL, the database query rate dropped from 8000 req/min to 1760 req/min."
+summary = "Redis caching reduced subscription status DB load by 78%"
+memory_type = "outcome"
+tags = ["redis", "cache", "database", "performance", "subscription"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.6
+created_days_ago = 65
+
+# ---------------------------------------------------------------------------
+# INCIDENTS
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000026"
+content = "Incident 2025-11-14: Payment processing outage for 47 minutes. Root cause: Stripe API rate limit exceeded due to a runaway retry loop. A bug in the retry logic used a fixed delay instead of exponential backoff, causing 10,000 requests per minute. Fix: deployed exponential backoff. Action item: add rate limit monitoring."
+summary = "Payment outage 47 min due to runaway Stripe retry loop"
+memory_type = "incident"
+tags = ["incident", "stripe", "retry", "outage", "payments"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 125
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000027"
+content = "Incident 2026-01-03: API gateway was returning 502 errors for 23 minutes. Root cause: Redis crashed due to OOM. The cache fill rate was too aggressive after a deployment. Redis was not configured with a memory limit. Fix: set maxmemory to 2gb and maxmemory-policy to allkeys-lru."
+summary = "API 502s for 23min due to Redis OOM, added maxmemory limit"
+memory_type = "incident"
+tags = ["incident", "redis", "oom", "api-gateway", "outage", "memory"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 75
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000028"
+content = "Incident 2026-02-18: Data inconsistency found in 142 billing records. Root cause: a race condition in the subscription renewal job. Two workers processed the same renewal simultaneously. Fix: added database-level advisory lock on subscription ID before renewal processing."
+summary = "142 billing records corrupted by concurrent renewal race condition"
+memory_type = "incident"
+tags = ["incident", "race-condition", "billing", "data-integrity", "advisory-lock"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.9
+created_days_ago = 29
+
+# ---------------------------------------------------------------------------
+# CODE CONTEXT - specific implementation notes
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000029"
+content = "The billing retry worker reads from the billing_retry_queue table. Entries older than 72 hours are automatically expired. The worker runs every 60 seconds and processes up to 100 records per cycle. Source: src/workers/billing_retry.rs."
+summary = "Billing retry worker: billing_retry_queue, 72h expiry, 100/cycle"
+memory_type = "code_context"
+tags = ["billing", "retry", "worker", "queue", "code"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.5
+created_days_ago = 45
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000030"
+content = "Authentication middleware is implemented in src/middleware/auth.rs. It validates JWT signatures using the RS256 algorithm. Public keys are fetched from the JWKS endpoint on startup and cached for 1 hour. On validation failure, returns 401 with WWW-Authenticate header."
+summary = "Auth middleware: RS256 JWT, JWKS cache 1h, returns 401"
+memory_type = "code_context"
+tags = ["auth", "jwt", "middleware", "rs256", "jwks", "code"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.6
+created_days_ago = 60
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000031"
+content = "Rate limiting is implemented per IP and per user token. IP rate limit: 100 req/min for unauthenticated. Token rate limit: 1000 req/min for standard tier, 10000 req/min for enterprise tier. Limits are stored in Redis with sliding window algorithm."
+summary = "Rate limiting: 100/min per IP, 1000/min per token (Redis sliding window)"
+memory_type = "code_context"
+tags = ["rate-limiting", "redis", "api", "code", "throttling"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.6
+created_days_ago = 55
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000032"
+content = "Invoice PDF generation is handled by the invoice_renderer service. It uses a Handlebars template at templates/invoice.hbs. Rendering is async and results are stored in S3 under invoices/{year}/{month}/{invoice_id}.pdf. Generation is triggered by the invoice.created event."
+summary = "Invoice PDF: Handlebars template, async, stored in S3"
+memory_type = "code_context"
+tags = ["invoice", "pdf", "s3", "handlebars", "async", "code"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.5
+created_days_ago = 80
+
+# ---------------------------------------------------------------------------
+# PREFERENCES - team preferences
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000033"
+content = "Prefer returning 422 Unprocessable Entity over 400 Bad Request for validation failures. 400 is used for malformed requests (bad JSON). 422 is used when the JSON is valid but the business rules are not satisfied."
+summary = "422 for validation failures, 400 for malformed requests"
+memory_type = "preference"
+tags = ["api", "http", "validation", "error-codes"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.5
+created_days_ago = 90
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000034"
+content = "All database migrations must be backwards compatible. Never add a NOT NULL column without a default value. Never rename a column or table in a single migration. Run migrations before deploying new code."
+summary = "DB migrations must be backwards compatible, run before deploy"
+memory_type = "preference"
+tags = ["database", "migrations", "deployment", "backwards-compatibility"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 200
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000035"
+content = "Log structured JSON to stdout. Never log PII (email, name, phone, address) at any log level. Include trace_id, span_id, service_name, and environment in every log line. Use log level WARN for retryable errors, ERROR for non-retryable."
+summary = "Structured JSON logs, no PII, include trace context"
+memory_type = "preference"
+tags = ["logging", "structured-logs", "pii", "observability"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.7
+created_days_ago = 150
+
+# ---------------------------------------------------------------------------
+# ARCHITECTURE
+# ---------------------------------------------------------------------------
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000036"
+content = "The API gateway is the single entry point for all client traffic. It handles authentication, rate limiting, and request routing. Backend services are not exposed directly. The gateway communicates with backends over gRPC on an internal network."
+summary = "API gateway: single entry point, auth+rate limit, gRPC to backends"
+memory_type = "architecture"
+tags = ["api-gateway", "grpc", "architecture", "routing", "auth"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 250
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000037"
+content = "Billing service owns the subscription state machine. State transitions: trialing -> active -> past_due -> canceled. Each transition emits a domain event. The state machine is implemented as a Rust enum with associated data and a transition function."
+summary = "Billing subscription state machine: trialing->active->past_due->canceled"
+memory_type = "architecture"
+tags = ["billing", "state-machine", "subscription", "rust", "architecture"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 110
+
+[[memories]]
+id = "00000000-0000-0000-0000-000000000038"
+content = "Service-to-service authentication uses mTLS. Each service has a certificate issued by the internal CA. Certificates are rotated every 90 days by Vault. No service can call another without a valid certificate."
+summary = "mTLS for service-to-service auth, Vault rotates certs every 90 days"
+memory_type = "architecture"
+tags = ["mtls", "security", "certificates", "vault", "service-mesh"]
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.8
+created_days_ago = 180
+
+# ---------------------------------------------------------------------------
+# EDGE CASE FIXTURES
+# ---------------------------------------------------------------------------
+
+# Low importance memory (should rank below high-importance matches)
+[[memories]]
+id = "00000000-0000-0000-0000-000000000039"
+content = "Postgres version: we are running PostgreSQL 16.2. The version can be checked with SELECT version(). We upgraded from 14 in December 2024."
+summary = "Running PostgreSQL 16.2, upgraded from 14 in Dec 2024"
+memory_type = "code_context"
+tags = ["postgresql", "version", "database"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.2
+created_days_ago = 90
+
+# Memory with no tags
+[[memories]]
+id = "00000000-0000-0000-0000-000000000040"
+content = "The on-call rotation uses PagerDuty. The escalation policy is: primary engineer 5 min, then secondary, then engineering manager. Silence period between 2-7am local time for P3 and below. P1 incidents have no silence period."
+summary = "PagerDuty on-call: 5min escalation, 2-7am silence for P3"
+memory_type = "guideline"
+tags = []
+project = ""
+team = "platform"
+organization = "acme"
+importance = 0.6
+created_days_ago = 200
+
+# EXPIRED memory - must never appear in search results
+[[memories]]
+id = "00000000-0000-0000-0000-000000000041"
+content = "DEPRECATED: Old Braintree payment processor configuration. BRAINTREE_MERCHANT_ID and BRAINTREE_PUBLIC_KEY are no longer used. Stripe replaced Braintree in Q2 2025."
+summary = "Deprecated Braintree config - no longer used"
+memory_type = "decision"
+tags = ["deprecated", "braintree", "payments"]
+project = "billing-service"
+team = "platform"
+organization = "acme"
+importance = 0.1
+created_days_ago = 400
+expires_days_ago = 100
+
+# NULL embedding memory - should be findable by full-text only
+[[memories]]
+id = "00000000-0000-0000-0000-000000000042"
+content = "INTERNAL: grpc_health_v1 proto definition stored at proto/health.proto. Used by load balancer health checks on port 50051."
+summary = "gRPC health check proto location"
+memory_type = "code_context"
+tags = ["grpc", "health-check", "proto", "internal"]
+project = "api-gateway"
+team = "platform"
+organization = "acme"
+importance = 0.3
+created_days_ago = 60
+null_embedding = true

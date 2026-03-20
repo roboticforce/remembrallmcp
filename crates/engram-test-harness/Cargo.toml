@@ -1,0 +1,16 @@
+[package]
+name = "engram-test-harness"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "engram-test"
+path = "src/main.rs"
+
+[dependencies]
+engram-core = { path = "../engram-core" }
+toml = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "engram-recall-test"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "engram-recall-test"
+path = "src/main.rs"
+
+[dependencies]
+engram-core = { path = "../engram-core" }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+pgvector = { workspace = true }
