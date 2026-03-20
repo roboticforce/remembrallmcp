@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "engram": {
-      "command": "/Users/steve/Dev/engram/target/release/engram-mcp",
+      "command": "/Users/steve/Dev/engram/target/release/engram",
       "env": {
         "DATABASE_URL": "postgres://postgres:postgres@localhost:5450/engram"
       }

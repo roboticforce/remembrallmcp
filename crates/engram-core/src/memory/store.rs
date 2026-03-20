@@ -304,11 +304,12 @@ impl MemoryStore {
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(limit as usize);
 
-        // --- Apply post-filters (type, tags) and hydrate ---
+        // --- Hydrate, filter, and apply decay scoring ---
         let mut results = Vec::new();
         for (id, rrf_score, match_type) in ranked {
-            // Fetch the full memory record (also bumps access_count)
-            let memory = match self.get(id).await {
+            // Fetch the full memory record without bumping access_count yet.
+            // We do a batch update after filtering so only returned memories count.
+            let memory = match self.get_readonly(id).await {
                 Ok(m) => m,
                 Err(_) => continue, // row may have been deleted
             };
@@ -327,11 +328,42 @@ impl MemoryStore {
                 }
             }
 
+            // Apply decay-with-reinforcement scoring.
+            // Gentle decay: half-life ~1 year (rate 0.002). Relevance is a soft
+            // blend so it nudges ranking without drastically reordering results.
+            // final_score = rrf_score * (0.7 + 0.3 * relevance)
+            // This means relevance can only adjust the score by +/- 30%.
+            let days_old = (Utc::now() - memory.created_at).num_days().max(0) as f64;
+            let decay = (-0.002_f64 * days_old).exp();
+            let usage_boost = (memory.access_count as f64 * 0.03).min(0.2);
+            let relevance = (decay * memory.importance as f64 + usage_boost).clamp(0.1, 1.0);
+            let final_score = rrf_score * (0.7 + 0.3 * relevance);
+
             results.push(MemorySearchResult {
                 memory,
-                score: rrf_score as f32,
+                score: final_score as f32,
                 match_type,
             });
+        }
+
+        // Re-sort by final (decay-adjusted) score descending.
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Batch-update access_count for all returned memories.
+        if !results.is_empty() {
+            let ids: Vec<Uuid> = results.iter().map(|r| r.memory.id).collect();
+            let _ = sqlx::query(&format!(
+                r#"
+                UPDATE {schema}.memories
+                SET access_count = access_count + 1, last_accessed_at = NOW()
+                WHERE id = ANY($1)
+                "#,
+                schema = self.schema,
+            ))
+            .bind(&ids)
+            .execute(&self.pool)
+            .await;
+            // Non-fatal: if this fails, scores still returned; next recall corrects the count.
         }
 
         Ok(results)
@@ -345,6 +377,22 @@ impl MemoryStore {
             SET access_count = access_count + 1, last_accessed_at = NOW()
             WHERE id = $1
             RETURNING *
+            "#,
+            schema = self.schema,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| EngramError::NotFound(format!("Memory {id}")))?;
+
+        Ok(row.into_memory())
+    }
+
+    /// Get a memory by ID without bumping access count. Used for contradiction checks.
+    pub async fn get_readonly(&self, id: Uuid) -> Result<Memory> {
+        let row = sqlx::query_as::<_, MemoryRow>(&format!(
+            r#"
+            SELECT * FROM {schema}.memories WHERE id = $1
             "#,
             schema = self.schema,
         ))

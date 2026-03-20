@@ -24,6 +24,9 @@ use engram_core::{
     parser::index_directory,
 };
 
+// Similarity threshold above which we flag a near-duplicate as a potential contradiction.
+const CONTRADICTION_THRESHOLD: f64 = 0.75;
+
 // ---------------------------------------------------------------------------
 // Parameter structs
 // ---------------------------------------------------------------------------
@@ -142,6 +145,27 @@ impl EngramServer {
             .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
             .map_err(|e| McpError::internal_error(format!("embedding failed: {e}"), None))?;
 
+        // Check for near-duplicate memories before storing (contradiction detection).
+        // We search at a high similarity threshold so only genuine semantic overlaps surface.
+        // Uses get_readonly so contradiction checks don't inflate access counts.
+        let near_dupes = self
+            .memory
+            .search_semantic(embedding.clone(), 3, CONTRADICTION_THRESHOLD, None)
+            .await
+            .unwrap_or_default();
+
+        let mut contradiction_list: Vec<serde_json::Value> = Vec::new();
+        for (dupe_id, similarity) in &near_dupes {
+            if let Ok(mem) = self.memory.get_readonly(*dupe_id).await {
+                contradiction_list.push(json!({
+                    "id": mem.id.to_string(),
+                    "similarity": (similarity * 100.0).round() / 100.0,
+                    "content": mem.content,
+                    "memory_type": mem.memory_type.to_string(),
+                }));
+            }
+        }
+
         let identifier = source_identifier.unwrap_or_else(|| "mcp".to_string());
 
         let input = CreateMemory {
@@ -170,7 +194,12 @@ impl EngramServer {
             .await
             .map_err(|e| McpError::internal_error(format!("store failed: {e}"), None))?;
 
-        let text = json!({ "id": id.to_string(), "stored": true }).to_string();
+        let mut response = json!({ "id": id.to_string(), "stored": true });
+        if !contradiction_list.is_empty() {
+            response["contradictions"] = json!(contradiction_list);
+        }
+
+        let text = response.to_string();
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
@@ -506,20 +535,17 @@ impl ServerHandler for EngramServer {
 // ---------------------------------------------------------------------------
 
 impl EngramServer {
-    /// Build from environment. Reads DATABASE_URL.
-    pub async fn from_env() -> anyhow::Result<Self> {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5450/engram".to_string());
-
+    /// Build from explicit parameters.
+    pub async fn from_config(database_url: &str, schema: &str) -> anyhow::Result<Self> {
         tracing::info!("Connecting to database: {database_url}");
 
         let pool = PgPoolOptions::new()
             .max_connections(10)
-            .connect(&database_url)
+            .connect(database_url)
             .await?;
 
-        let memory = Arc::new(MemoryStore::new(pool.clone(), "engram".to_string()));
-        let graph = Arc::new(GraphStore::new(pool.clone(), "engram".to_string()));
+        let memory = Arc::new(MemoryStore::new(pool.clone(), schema.to_string()));
+        let graph = Arc::new(GraphStore::new(pool.clone(), schema.to_string()));
 
         tracing::info!("Initializing stores...");
         memory.init().await?;
@@ -534,5 +560,20 @@ impl EngramServer {
             embedder,
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Build from environment. Reads DATABASE_URL / ENGRAM_DATABASE_URL.
+    /// Delegates to from_config.
+    pub async fn from_env() -> anyhow::Result<Self> {
+        let database_url = std::env::var("ENGRAM_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| {
+                "postgres://postgres:postgres@localhost:5450/engram".to_string()
+            });
+
+        let schema = std::env::var("ENGRAM_SCHEMA")
+            .unwrap_or_else(|_| "engram".to_string());
+
+        Self::from_config(&database_url, &schema).await
     }
 }
