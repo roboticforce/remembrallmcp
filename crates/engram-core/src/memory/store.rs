@@ -417,6 +417,91 @@ impl MemoryStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Update fields on an existing memory. Only `Some` fields are changed.
+    /// Always updates `updated_at`. Returns `true` if the row existed.
+    pub async fn update(
+        &self,
+        id: Uuid,
+        content: Option<String>,
+        summary: Option<String>,
+        tags: Option<Vec<String>>,
+        importance: Option<f32>,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<bool> {
+        // Build SET clause dynamically - only columns that are Some.
+        // Parameter $1 is always the id (used in WHERE). Content fields start at $2.
+        let mut set_clauses: Vec<String> = Vec::new();
+        let mut param_index: u32 = 2; // $1 reserved for id in WHERE
+
+        if content.is_some() {
+            set_clauses.push(format!("content = ${param_index}"));
+            param_index += 1;
+            set_clauses.push(format!("content_fingerprint = ${param_index}"));
+            param_index += 1;
+        }
+        if summary.is_some() {
+            set_clauses.push(format!("summary = ${param_index}"));
+            param_index += 1;
+        }
+        if tags.is_some() {
+            set_clauses.push(format!("tags = ${param_index}"));
+            param_index += 1;
+        }
+        if importance.is_some() {
+            set_clauses.push(format!("importance = ${param_index}"));
+            param_index += 1;
+        }
+        if embedding.is_some() {
+            set_clauses.push(format!("embedding = ${param_index}"));
+            // param_index not incremented; last field
+        }
+        set_clauses.push("updated_at = NOW()".to_string());
+
+        if set_clauses.len() == 1 {
+            // Only updated_at - nothing actually requested; still a no-op update is fine,
+            // but return true only if the row exists.
+            let row = sqlx::query_as::<_, (Uuid,)>(&format!(
+                "SELECT id FROM {schema}.memories WHERE id = $1",
+                schema = self.schema,
+            ))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            return Ok(row.is_some());
+        }
+
+        let sql = format!(
+            "UPDATE {schema}.memories SET {sets} WHERE id = $1",
+            schema = self.schema,
+            sets = set_clauses.join(", "),
+        );
+
+        // Bind parameters in the same order they were added to set_clauses.
+        let mut q = sqlx::query(&sql).bind(id); // $1
+
+        if let Some(ref c) = content {
+            let fp = compute_fingerprint(c);
+            q = q.bind(c);   // content
+            q = q.bind(fp);  // content_fingerprint
+        }
+        if let Some(ref s) = summary {
+            q = q.bind(s);
+        }
+        if let Some(ref t) = tags {
+            q = q.bind(t);
+        }
+        if let Some(i) = importance {
+            q = q.bind(i);
+        }
+        if let Some(emb) = embedding {
+            let vec = Vector::from(emb);
+            q = q.bind(vec);
+        }
+
+        let result = q.execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Check for duplicate by content fingerprint.
     pub async fn find_by_fingerprint(&self, fingerprint: &str) -> Result<Option<Uuid>> {
         let row = sqlx::query_as::<_, (Uuid,)>(&format!(
