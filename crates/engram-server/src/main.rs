@@ -48,6 +48,18 @@ enum Commands {
 
     /// Print version information
     Version,
+
+    /// Watch project directories and auto-reindex on file changes
+    Watch {
+        /// Directories to watch (can specify multiple)
+        #[arg(required = true)]
+        paths: Vec<String>,
+
+        /// Project name override (used when only one path is given; otherwise
+        /// the directory basename is used for each path)
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -63,6 +75,7 @@ async fn main() -> Result<()> {
         Some(Commands::Doctor) => cmd_doctor().await,
         Some(Commands::Reset { force }) => cmd_reset(force).await,
         Some(Commands::Version) => cmd_version(),
+        Some(Commands::Watch { paths, project }) => cmd_watch(paths, project).await,
     }
 }
 
@@ -570,6 +583,107 @@ async fn cmd_reset(force: bool) -> Result<()> {
 
     println!("All data reset. Schema recreated.");
     Ok(())
+}
+
+async fn cmd_watch(paths: Vec<String>, project: Option<String>) -> Result<()> {
+    // Set up logging to stderr.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+
+    let config = EngramConfig::load();
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&config.database.url)
+        .await
+        .map_err(|e| anyhow::anyhow!(
+            "Cannot connect to database. Is Postgres running? Error: {}", e
+        ))?;
+
+    let graph = std::sync::Arc::new(
+        engram_core::graph::store::GraphStore::new(pool, config.database.schema.clone()),
+    );
+    graph.init().await?;
+
+    // Resolve each path to an absolute PathBuf and derive a project name.
+    let mut project_dirs: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for (i, raw_path) in paths.iter().enumerate() {
+        let abs = std::path::Path::new(raw_path)
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("cannot resolve path '{}': {}", raw_path, e))?;
+
+        let name = if paths.len() == 1 {
+            // Single path: use --project override if given, else basename.
+            project
+                .clone()
+                .unwrap_or_else(|| basename(&abs))
+        } else {
+            // Multiple paths: ignore --project (ambiguous) and use basename of each.
+            if i == 0 && project.is_some() {
+                tracing::warn!("--project is ignored when multiple paths are specified; using directory basenames");
+            }
+            basename(&abs)
+        };
+
+        project_dirs.push((abs, name));
+    }
+
+    // Initial full index of every registered project.
+    for (root, proj) in &project_dirs {
+        tracing::info!("initial index: {} (project={})", root.display(), proj);
+        let root_clone = root.clone();
+        let proj_clone = proj.clone();
+        let index_result = tokio::task::spawn_blocking(move || {
+            engram_core::parser::index_directory(&root_clone, &proj_clone, None)
+        })
+        .await??;
+
+        for symbol in &index_result.symbols {
+            if let Err(e) = graph.upsert_symbol(symbol).await {
+                tracing::warn!("upsert_symbol failed: {e}");
+            }
+        }
+        for rel in &index_result.relationships {
+            if let Err(e) = graph.add_relationship(rel).await {
+                tracing::debug!("skipping relationship: {e}");
+            }
+        }
+        tracing::info!(
+            "indexed {} - {} files, {} symbols, {} relationships",
+            root.display(),
+            index_result.files_parsed,
+            index_result.symbols.len(),
+            index_result.relationships.len(),
+        );
+    }
+
+    // Build the watcher and register all project directories.
+    let fw = engram_server::watcher::FileWatcher::new(std::sync::Arc::clone(&graph));
+    for (root, proj) in project_dirs {
+        fw.add_project(root, proj).await;
+    }
+
+    tracing::info!("watching for changes (press Ctrl+C to stop)");
+
+    // Run the watcher loop. This blocks until Ctrl+C / process exit.
+    fw.run().await;
+
+    Ok(())
+}
+
+/// Return the last path component as a string, falling back to the full path.
+fn basename(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or("unknown"))
+        .to_string()
 }
 
 fn cmd_version() -> Result<()> {

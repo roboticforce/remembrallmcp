@@ -1,8 +1,13 @@
 //! Engram MCP server - exposes memory and graph tools over the Model Context Protocol.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
 use walkdir::WalkDir;
+
+pub mod watcher;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -143,6 +148,9 @@ pub struct EngramServer {
     graph: Arc<GraphStore>,
     embedder: Arc<dyn Embedder>,
     tool_router: ToolRouter<Self>,
+    /// Directories that have already had a background watcher spawned.
+    /// Guarded by a mutex so concurrent `engram_index` calls don't race.
+    watched_dirs: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +429,37 @@ impl EngramServer {
             }
         }
 
+        // Spawn a background watcher for this directory if not already watching.
+        // The watcher keeps the graph fresh for subsequent queries without
+        // requiring the agent to call engram_index again.
+        let canonical = std::path::Path::new(&path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+
+        let already_watching = {
+            let mut guard = self.watched_dirs.lock().await;
+            if guard.contains(&canonical) {
+                true
+            } else {
+                guard.insert(canonical.clone());
+                false
+            }
+        };
+
+        if !already_watching {
+            let graph_arc = Arc::clone(&self.graph);
+            let project_name = project.clone();
+            let watch_root = canonical.clone();
+
+            tokio::spawn(async move {
+                let fw = watcher::FileWatcher::new(graph_arc);
+                fw.add_project(watch_root, project_name).await;
+                fw.run().await;
+            });
+
+            tracing::info!("background watcher started for {}", canonical.display());
+        }
+
         let text = json!({
             "path": path,
             "project": project,
@@ -428,7 +467,8 @@ impl EngramServer {
             "files_skipped": index_result.files_skipped,
             "symbols_stored": symbols_stored,
             "relationships_stored": relationships_stored,
-            "note": "Indexing complete. Impact analysis results will reflect the updated graph.",
+            "watching": !already_watching,
+            "note": "Indexing complete. A background watcher is now keeping the graph up to date.",
         })
         .to_string();
 
@@ -1007,6 +1047,7 @@ impl EngramServer {
             graph,
             embedder,
             tool_router: Self::tool_router(),
+            watched_dirs: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
