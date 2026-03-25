@@ -3,6 +3,7 @@ use pgvector::Vector;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::config::validate_schema_name;
 use crate::error::{EngramError, Result};
 use super::types::*;
 
@@ -13,8 +14,10 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
-    pub fn new(pool: PgPool, schema: String) -> Self {
-        Self { pool, schema }
+    pub fn new(pool: PgPool, schema: String) -> Result<Self> {
+        validate_schema_name(&schema)
+            .map_err(EngramError::InvalidInput)?;
+        Ok(Self { pool, schema })
     }
 
     /// Initialize database schema (tables, indexes, extensions).
@@ -517,19 +520,27 @@ impl MemoryStore {
 
     /// Count all memories, optionally filtered by scope.
     pub async fn count(&self, scope: Option<&Scope>) -> Result<i64> {
-        let sql = match scope {
+        // Build WHERE clauses with sequential parameter numbers for only the
+        // scope fields that are actually Some.
+        let (sql, org, team, project) = match scope {
             Some(s) => {
-                let mut where_clauses = vec![];
+                let mut where_clauses: Vec<String> = vec![];
+                let mut param_index: u32 = 1;
+
                 if s.organization.is_some() {
-                    where_clauses.push("scope_organization = $1".to_string());
+                    where_clauses.push(format!("scope_organization = ${param_index}"));
+                    param_index += 1;
                 }
                 if s.team.is_some() {
-                    where_clauses.push("scope_team = $2".to_string());
+                    where_clauses.push(format!("scope_team = ${param_index}"));
+                    param_index += 1;
                 }
                 if s.project.is_some() {
-                    where_clauses.push("scope_project = $3".to_string());
+                    where_clauses.push(format!("scope_project = ${param_index}"));
+                    // param_index not incremented; last field
                 }
-                if where_clauses.is_empty() {
+
+                let sql = if where_clauses.is_empty() {
                     format!("SELECT COUNT(*) FROM {schema}.memories", schema = self.schema)
                 } else {
                     format!(
@@ -537,14 +548,29 @@ impl MemoryStore {
                         schema = self.schema,
                         clauses = where_clauses.join(" AND ")
                     )
-                }
+                };
+                (sql, s.organization.clone(), s.team.clone(), s.project.clone())
             }
-            None => format!("SELECT COUNT(*) FROM {schema}.memories", schema = self.schema),
+            None => (
+                format!("SELECT COUNT(*) FROM {schema}.memories", schema = self.schema),
+                None,
+                None,
+                None,
+            ),
         };
 
-        let (count,) = sqlx::query_as::<_, (i64,)>(&sql)
-            .fetch_one(&self.pool)
-            .await?;
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+        if org.is_some() {
+            q = q.bind(org);
+        }
+        if team.is_some() {
+            q = q.bind(team);
+        }
+        if project.is_some() {
+            q = q.bind(project);
+        }
+
+        let (count,) = q.fetch_one(&self.pool).await?;
 
         Ok(count)
     }

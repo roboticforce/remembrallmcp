@@ -1,7 +1,8 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::config::validate_schema_name;
+use crate::error::{EngramError, Result};
 use super::types::*;
 
 /// Code graph storage backed by Postgres adjacency tables + recursive CTEs.
@@ -11,8 +12,10 @@ pub struct GraphStore {
 }
 
 impl GraphStore {
-    pub fn new(pool: PgPool, schema: String) -> Self {
-        Self { pool, schema }
+    pub fn new(pool: PgPool, schema: String) -> Result<Self> {
+        validate_schema_name(&schema)
+            .map_err(EngramError::InvalidInput)?;
+        Ok(Self { pool, schema })
     }
 
     /// Initialize graph tables.

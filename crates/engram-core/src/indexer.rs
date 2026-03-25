@@ -16,6 +16,7 @@ use sqlx::PgPool;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use crate::config::validate_schema_name;
 use crate::error::{EngramError, Result};
 use crate::graph::types::{Relationship, Symbol};
 use crate::graph::GraphStore;
@@ -119,9 +120,11 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn new(pool: PgPool, schema: String, config: IndexerConfig) -> Self {
-        let graph = GraphStore::new(pool.clone(), schema.clone());
-        Self { pool, graph, schema, config }
+    pub fn new(pool: PgPool, schema: String, config: IndexerConfig) -> Result<Self> {
+        validate_schema_name(&schema)
+            .map_err(EngramError::InvalidInput)?;
+        let graph = GraphStore::new(pool.clone(), schema.clone())?;
+        Ok(Self { pool, graph, schema, config })
     }
 
     /// Ensure the `file_index` tracking table exists.

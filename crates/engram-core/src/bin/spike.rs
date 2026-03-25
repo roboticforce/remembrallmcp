@@ -30,8 +30,8 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let schema = "engram".to_string();
-    let memory_store = MemoryStore::new(pool.clone(), schema.clone());
-    let graph_store = GraphStore::new(pool.clone(), schema.clone());
+    let memory_store = MemoryStore::new(pool.clone(), schema.clone())?;
+    let graph_store = GraphStore::new(pool.clone(), schema.clone())?;
 
     // --- Initialize ---
     println!("\n--- Initializing schema ---");

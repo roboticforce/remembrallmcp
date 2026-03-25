@@ -1,5 +1,41 @@
 use serde::Deserialize;
 
+/// Validate a Postgres schema name to prevent SQL injection.
+///
+/// Rules:
+/// - 1-63 characters (Postgres identifier limit)
+/// - Only ASCII alphanumeric characters and underscores
+/// - Must not start with a digit
+pub fn validate_schema_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("schema name must not be empty".to_string());
+    }
+    if name.len() > 63 {
+        return Err(format!(
+            "schema name '{}' exceeds 63-character limit",
+            name
+        ));
+    }
+    let mut chars = name.chars();
+    // Safety: we already checked non-empty above
+    let first = chars.next().unwrap();
+    if first.is_ascii_digit() {
+        return Err(format!(
+            "schema name '{}' must not start with a digit",
+            name
+        ));
+    }
+    for ch in std::iter::once(first).chain(chars) {
+        if !ch.is_ascii_alphanumeric() && ch != '_' {
+            return Err(format!(
+                "schema name '{}' contains invalid character '{}' (only ASCII alphanumeric and underscore allowed)",
+                name, ch
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub database_url: String,

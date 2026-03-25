@@ -932,7 +932,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(DATABASE_URL)
         .await?;
 
-    let graph_store = GraphStore::new(pool.clone(), SCHEMA.to_string());
+    let graph_store = GraphStore::new(pool.clone(), SCHEMA.to_string())?;
 
     // Initialize schema (idempotent)
     print!("Initializing graph schema... ");

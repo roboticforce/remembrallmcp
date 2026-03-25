@@ -696,8 +696,8 @@ async fn main() -> Result<()> {
         .execute(&pool)
         .await?;
 
-    let memory = MemoryStore::new(pool.clone(), schema.to_string());
-    let graph = GraphStore::new(pool.clone(), schema.to_string());
+    let memory = MemoryStore::new(pool.clone(), schema.to_string())?;
+    let graph = GraphStore::new(pool.clone(), schema.to_string())?;
     memory.init().await?;
     graph.init().await?;
 

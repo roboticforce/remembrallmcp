@@ -67,7 +67,7 @@ async fn run() -> Result<i32> {
         .context("connecting to Postgres")?;
 
     // Initialize memory store
-    let store = MemoryStore::new(pool.clone(), schema.clone());
+    let store = MemoryStore::new(pool.clone(), schema.clone())?;
     store.init().await.context("initializing memory store")?;
 
     // Load embedding model

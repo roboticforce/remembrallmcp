@@ -94,6 +94,11 @@ impl EngramConfig {
             config.database.schema = schema;
         }
 
+        // Validate the schema name to prevent SQL injection via configuration.
+        if let Err(e) = engram_core::config::validate_schema_name(&config.database.schema) {
+            panic!("Invalid ENGRAM_SCHEMA: {}", e);
+        }
+
         config
     }
 
@@ -112,7 +117,13 @@ impl EngramConfig {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
+        std::fs::write(&path, &content)?;
+        // Restrict access to the owner only - the file contains the database URL.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 }

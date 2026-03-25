@@ -134,12 +134,12 @@ async fn cmd_init(database_url: Option<String>, port: u16) -> Result<()> {
         let memory_store = engram_core::memory::store::MemoryStore::new(
             pool.clone(),
             config.database.schema.clone(),
-        );
+        )?;
         memory_store.init().await?;
         let graph_store = engram_core::graph::store::GraphStore::new(
             pool.clone(),
             config.database.schema.clone(),
-        );
+        )?;
         graph_store.init().await?;
 
         println!("Database ready.\n");
@@ -267,12 +267,12 @@ async fn cmd_init(database_url: Option<String>, port: u16) -> Result<()> {
         let memory_store = engram_core::memory::store::MemoryStore::new(
             pool.clone(),
             config.database.schema.clone(),
-        );
+        )?;
         memory_store.init().await?;
         let graph_store = engram_core::graph::store::GraphStore::new(
             pool.clone(),
             config.database.schema.clone(),
-        );
+        )?;
         graph_store.init().await?;
 
         println!("Database ready.\n");
@@ -498,10 +498,10 @@ async fn cmd_doctor() -> Result<()> {
                 issues += 1;
             }
 
-            let has_schema: bool = sqlx::query_scalar(&format!(
-                "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = '{}')",
-                config.database.schema
-            ))
+            let has_schema: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+            )
+            .bind(&config.database.schema)
             .fetch_one(&pool)
             .await
             .unwrap_or(false);
@@ -573,12 +573,12 @@ async fn cmd_reset(force: bool) -> Result<()> {
     let memory_store = engram_core::memory::store::MemoryStore::new(
         pool.clone(),
         config.database.schema.clone(),
-    );
+    )?;
     memory_store.init().await?;
     let graph_store = engram_core::graph::store::GraphStore::new(
         pool.clone(),
         config.database.schema.clone(),
-    );
+    )?;
     graph_store.init().await?;
 
     println!("All data reset. Schema recreated.");
@@ -608,7 +608,7 @@ async fn cmd_watch(paths: Vec<String>, project: Option<String>) -> Result<()> {
         ))?;
 
     let graph = std::sync::Arc::new(
-        engram_core::graph::store::GraphStore::new(pool, config.database.schema.clone()),
+        engram_core::graph::store::GraphStore::new(pool, config.database.schema.clone())?,
     );
     graph.init().await?;
 

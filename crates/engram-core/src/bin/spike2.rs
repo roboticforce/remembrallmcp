@@ -552,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let schema = "engram".to_string();
-    let graph_store = GraphStore::new(pool.clone(), schema.clone());
+    let graph_store = GraphStore::new(pool.clone(), schema.clone())?;
     let patterns = Patterns::new();
 
     // Initialize schema

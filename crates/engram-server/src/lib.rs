@@ -576,6 +576,23 @@ impl EngramServer {
         Parameters(IngestGithubParams { repo, limit, project }): Parameters<IngestGithubParams>,
     ) -> Result<CallToolResult, McpError> {
         let limit = limit.unwrap_or(50).min(200);
+
+        // Validate repo is in "owner/repo" format before passing to the shell.
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2
+            || parts.iter().any(|p| {
+                p.is_empty()
+                    || !p
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            })
+        {
+            return Err(McpError::invalid_params(
+                "repo must be in 'owner/repo' format (alphanumeric, hyphens, underscores, dots only)",
+                None,
+            ));
+        }
+
         let project = project.unwrap_or_else(|| {
             repo.split('/').last().unwrap_or("unknown").to_string()
         });
@@ -783,7 +800,8 @@ impl EngramServer {
             .iter()
             .map(|r| {
                 let content = if r.memory.content.len() > 2000 {
-                    format!("{}...[truncated]", &r.memory.content[..2000])
+                    let end = r.memory.content.floor_char_boundary(2000);
+                    format!("{}...[truncated]", &r.memory.content[..end])
                 } else {
                     r.memory.content.clone()
                 };
@@ -1122,8 +1140,8 @@ impl EngramServer {
                 e
             ))?;
 
-        let memory = Arc::new(MemoryStore::new(pool.clone(), schema.to_string()));
-        let graph = Arc::new(GraphStore::new(pool.clone(), schema.to_string()));
+        let memory = Arc::new(MemoryStore::new(pool.clone(), schema.to_string())?);
+        let graph = Arc::new(GraphStore::new(pool.clone(), schema.to_string())?);
 
         tracing::info!("Initializing stores...");
         memory.init().await?;
