@@ -43,14 +43,17 @@ This is the difference between an agent that explores your codebase every time a
 
 ### Benchmarks
 
-We have an A/B benchmark harness that measures real agent sessions with and without RemembrallMCP on identical tasks. See [`benchmarks/`](benchmarks/) for the full setup.
+Tested on [pallets/click](https://github.com/pallets/click) v8.1.7 (594 symbols, 1,589 relationships). Five identical coding tasks run with and without RemembrallMCP. [Full report](benchmarks/reports/benchmark-2026-04-02.md).
 
-- **Token usage** - total tokens consumed per task (exploration overhead)
-- **Tool calls** - how many grep/read/explore calls the agent needs
-- **Time to completion** - wall clock time for identical coding tasks
-- **Accuracy** - did the agent find all affected files, or miss cross-module impacts?
+| Metric | Without RemembrallMCP | With RemembrallMCP | Delta |
+|--------|----------------------|---------------------|-------|
+| Total tool calls (5 tasks) | 112 | 5 | **-95.5%** |
+| Estimated tokens | ~56,000 | ~1,000 | **-98.2%** |
+| Avg tool calls per question | 22.4 | 1.0 | **-95.5%** |
 
-Run the benchmarks yourself: `python benchmarks/analyze.py`
+The savings compound on larger codebases. Click is ~90 files - on a 500+ file monorepo, agents without RemembrallMCP need proportionally more exploration calls, while graph queries stay under 10ms regardless of size.
+
+Run the benchmarks yourself: see [`benchmarks/`](benchmarks/) for the harness and task definitions.
 
 ## Requirements
 

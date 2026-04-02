@@ -46,3 +46,7 @@ fastembed = "5"
 [[bin]]
 name = "kt_ast_debug"
 path = "src/bin/kt_ast_debug.rs"
+
+[[bin]]
+name = "bench_index"
+path = "src/bin/bench_index.rs"
