@@ -1,28 +1,34 @@
 # RemembrallMCP
 
-Persistent knowledge memory layer for AI agents. Rust core, Postgres + pgvector backend, MCP protocol.
+Persistent knowledge memory and code intelligence for AI agents. Rust core, Postgres + pgvector, MCP protocol.
 
-**The problem:** AI coding agents (Copilot, Cursor, Claude Code, Devin) are stateless. Every session starts from zero - no memory of past decisions, team preferences, error patterns, or how the codebase fits together.
+**The problem:** AI coding agents are stateless. Every session starts from zero - no memory of past decisions, no understanding of how the codebase fits together, no way to know what breaks when you change something.
 
-**The solution:** RemembrallMCP gives agents persistent memory through the [Model Context Protocol](https://modelcontextprotocol.io). Decisions, patterns, code relationships, and organizational context survive between sessions and are available to any MCP-compatible client.
+**The solution:** RemembrallMCP gives agents two things most memory tools don't:
+
+**1. Persistent Memory** - Decisions, patterns, and organizational knowledge that survive between sessions. Hybrid semantic + full-text search finds relevant context instantly.
+
+**2. Code Dependency Graph** - A live map of your codebase built with tree-sitter. Functions, classes, imports, and call relationships across 8 languages. Ask "what breaks if I change this?" and get an answer in milliseconds - before the agent touches anything.
 
 ```
-Agent starts a task
-  |
-  remembrall_recall("authentication middleware patterns")
-  -> Returns 3 relevant memories from past sessions
-  |
-  remembrall_index("/path/to/project", "myapp")
-  -> Builds code dependency graph
-  |
-  remembrall_impact("AuthMiddleware", direction="upstream")
-  -> Shows 12 files that depend on AuthMiddleware
-  |
-  Agent makes the change with full context
-  |
-  remembrall_store("Switched from JWT to session tokens because...")
-  -> Stores the decision for future agents
+remembrall_recall("authentication middleware patterns")
+-> 3 relevant memories from past sessions
+
+remembrall_index("/path/to/project", "myapp")
+-> Builds dependency graph: 847 symbols, 1,203 relationships
+
+remembrall_impact("AuthMiddleware", direction="upstream")
+-> 12 files depend on AuthMiddleware (with confidence scores)
+
+remembrall_store("Switched from JWT to session tokens because...")
+-> Decision stored for future sessions
 ```
+
+### Why the code graph matters
+
+Most MCP memory servers store and retrieve text. That helps with "what did we decide?" but not with "what happens if I change this?"
+
+RemembrallMCP parses your source code into a queryable dependency graph. An agent can check blast radius before making changes, find where a function is defined across the whole project, and trace call chains through multiple files. This is the difference between an agent that remembers and an agent that understands your codebase.
 
 ## Requirements
 
@@ -99,6 +105,8 @@ Restart your MCP client. All 9 tools will be available automatically.
 
 ## MCP Tools
 
+### Memory
+
 | Tool | Description |
 |------|-------------|
 | `remembrall_recall` | Search memories - hybrid semantic + full-text with RRF fusion |
@@ -107,9 +115,14 @@ Restart your MCP client. All 9 tools will be available automatically.
 | `remembrall_delete` | Remove a memory by UUID |
 | `remembrall_ingest_github` | Bulk-import merged PR descriptions from a GitHub repo |
 | `remembrall_ingest_docs` | Scan a directory for markdown files and ingest them as memories |
+
+### Code Intelligence
+
+| Tool | Description |
+|------|-------------|
+| `remembrall_index` | Parse a project directory into a dependency graph (8 languages) |
 | `remembrall_impact` | Blast radius analysis - "what breaks if I change this?" |
-| `remembrall_lookup_symbol` | Find where a function or class is defined |
-| `remembrall_index` | Index a project directory to build the code graph |
+| `remembrall_lookup_symbol` | Find where a function or class is defined across the project |
 
 ## Supported Languages
 
