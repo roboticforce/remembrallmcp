@@ -4,6 +4,13 @@
 //!
 //! Handles Rails conventions: controllers, models, mixins, scopes,
 //! callbacks, associations, and nested module/class definitions.
+//!
+//! # Note on type annotations
+//! Ruby is dynamically typed. Standard Ruby has no type annotation syntax in
+//! the language itself (RBS type signatures live in separate `.rbs` files, not
+//! inline in `.rb` source). The tree-sitter-ruby grammar therefore has no type
+//! annotation nodes to extract, so this parser does not emit UsesType
+//! relationships.
 
 use std::collections::{HashMap, HashSet};
 

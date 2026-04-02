@@ -311,6 +311,9 @@ fn process_import_from_statement(node: &Node<'_>, source: &[u8], ctx: &mut Parse
     }
 
     // Collect all imported names so we can score calls as "imported" (0.8).
+    // Also emit UsesType relationships for symbol-level imports so that queries
+    // like "what references BaseCommand" find the importing file (e.g. __init__.py).
+    let file_id = ctx.result.symbols[0].id;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -321,14 +324,39 @@ fn process_import_from_statement(node: &Node<'_>, source: &[u8], ctx: &mut Parse
                         .map(|n| n.id())
                         .unwrap_or(0) =>
             {
-                ctx.imported_names.insert(node_text(&child, source));
+                let import_name = node_text(&child, source);
+                ctx.imported_names.insert(import_name.clone());
+                // Emit UsesType from file -> imported symbol.
+                if !import_name.is_empty() && !is_builtin_type(&import_name) {
+                    let target_id =
+                        Uuid::new_v5(&Uuid::NAMESPACE_OID, import_name.as_bytes());
+                    ctx.result.relationships.push(Relationship {
+                        source_id: file_id,
+                        target_id,
+                        rel_type: RelationType::UsesType,
+                        confidence: 0.8,
+                    });
+                }
             }
             "aliased_import" => {
+                // Record alias in imported_names for call scoring.
                 if let Some(alias) = child.child_by_field_name("alias") {
                     ctx.imported_names.insert(node_text(&alias, source));
                 }
-                if let Some(name) = child.child_by_field_name("name") {
-                    ctx.imported_names.insert(node_text(&name, source));
+                // Use the original name (not the alias) for the UsesType target.
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let import_name = node_text(&name_node, source);
+                    ctx.imported_names.insert(import_name.clone());
+                    if !import_name.is_empty() && !is_builtin_type(&import_name) {
+                        let target_id =
+                            Uuid::new_v5(&Uuid::NAMESPACE_OID, import_name.as_bytes());
+                        ctx.result.relationships.push(Relationship {
+                            source_id: file_id,
+                            target_id,
+                            rel_type: RelationType::UsesType,
+                            confidence: 0.8,
+                        });
+                    }
                 }
             }
             "wildcard_import" => {}
@@ -716,7 +744,7 @@ fn is_builtin_type(name: &str) -> bool {
 // Call collection
 // ---------------------------------------------------------------------------
 
-/// Walk the entire tree looking for call expressions.
+/// Walk the entire tree looking for call expressions and typed variable annotations.
 fn collect_calls<'a>(
     node: &Node<'a>,
     source: &[u8],
@@ -727,8 +755,58 @@ fn collect_calls<'a>(
         if child.kind() == "call" {
             process_call(&child, source, ctx);
         }
+        // `cmd: BaseCommand = get_command()` - typed variable annotation inside a
+        // function body.  tree-sitter-python represents this as an `assignment` node
+        // with a `type` field.
+        if child.kind() == "assignment" {
+            if let Some(type_node) = child.child_by_field_name("type") {
+                process_variable_annotation(&child, &type_node, source, ctx);
+            }
+        }
         let mut inner = child.walk();
         collect_calls(&child, source, ctx, &mut inner);
+    }
+}
+
+/// Emit `UsesType` relationships for a typed variable annotation found inside a
+/// function body: `name: SomeType = ...`
+///
+/// The relationship source is the innermost enclosing function/method; if the
+/// annotation appears at module scope the file symbol is used instead.
+fn process_variable_annotation(
+    assignment_node: &Node<'_>,
+    type_node: &Node<'_>,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    let mut type_names: Vec<String> = Vec::new();
+    extract_type_identifiers(type_node, source, &mut type_names);
+
+    if type_names.is_empty() {
+        return;
+    }
+
+    let source_id = find_enclosing_function(assignment_node, source, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    for type_name in type_names {
+        if is_builtin_type(&type_name) {
+            continue;
+        }
+        let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(&type_name) {
+            (id, 1.0_f32)
+        } else if ctx.imported_names.contains(&type_name) {
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.8)
+        } else {
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.5)
+        };
+
+        ctx.result.relationships.push(Relationship {
+            source_id,
+            target_id,
+            rel_type: RelationType::UsesType,
+            confidence,
+        });
     }
 }
 

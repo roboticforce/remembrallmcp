@@ -14,6 +14,7 @@
 //! - `call_expression` -> RelationType::Calls
 //! - `delegation_specifiers` in class declarations -> RelationType::Inherits
 //! - Classes/functions defined inside a scope -> RelationType::Defines
+//! - Function/method parameter and return types -> RelationType::UsesType
 
 use std::collections::{HashMap, HashSet};
 
@@ -82,6 +83,9 @@ pub fn parse_kotlin_file(
 
     // Pass 3: collect call expressions.
     collect_calls(&root, source_bytes, &mut ctx);
+
+    // Pass 4: collect type annotations from function/method signatures.
+    collect_type_annotations(&root, source_bytes, &mut ctx);
 
     ctx.result
 }
@@ -689,6 +693,176 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Opti
     }
 
     best.map(|(id, _, _)| id)
+}
+
+// ---------------------------------------------------------------------------
+// Type annotation collection
+// ---------------------------------------------------------------------------
+
+/// Walk all `function_declaration` nodes anywhere in the tree and emit
+/// UsesType relationships for each non-builtin type found in parameter and
+/// return type positions.
+fn collect_type_annotations(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "function_declaration" {
+            process_func_type_annotations(&child, source, ctx);
+        }
+        collect_type_annotations(&child, source, ctx);
+    }
+}
+
+/// Emit UsesType relationships for all non-builtin types in a
+/// `function_declaration`'s parameters and return type.
+fn process_func_type_annotations(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, source))
+        .unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+    let func_id = match ctx.name_to_id.get(&name).copied() {
+        Some(id) => id,
+        None => return,
+    };
+
+    // Parameter types: walk function_value_parameters children.
+    if let Some(params_node) = find_child_by_kind(node, "function_value_parameters") {
+        for type_name in extract_kotlin_type_identifiers(&params_node, source) {
+            emit_uses_type(func_id, &type_name, ctx);
+        }
+    }
+
+    // Return type: appears directly after function_value_parameters.
+    if let Some(ret_text) = find_return_type(node, source) {
+        // find_return_type returns the full type text; extract identifiers from it.
+        for type_name in extract_type_names_from_text(&ret_text) {
+            if !is_kotlin_builtin(&type_name) {
+                emit_uses_type(func_id, &type_name, ctx);
+            }
+        }
+    }
+}
+
+/// Recursively collect non-builtin type identifier strings from a Kotlin
+/// parameter list node subtree.
+///
+/// Handles:
+/// - `user_type`       - `MyType` or `pkg.MyType` (first identifier segment)
+/// - `nullable_type`   - `MyType?` (recurse into wrapped type)
+/// - `type_identifier` - bare identifier used as a type
+fn extract_kotlin_type_identifiers(node: &Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut result = Vec::new();
+    collect_kotlin_type_ids(node, source, &mut result);
+    result
+}
+
+fn collect_kotlin_type_ids(node: &Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "user_type" => {
+            // Extract the first identifier segment (strips generics and qualifiers).
+            let name = extract_simple_type_name(node, source);
+            if !name.is_empty() && !is_kotlin_builtin(&name) {
+                out.push(name);
+            }
+        }
+        "nullable_type" => {
+            // Recurse into the inner type.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_kotlin_type_ids(&child, source, out);
+            }
+        }
+        "type_identifier" => {
+            let name = node_text(node, source);
+            if !name.is_empty() && !is_kotlin_builtin(&name) {
+                out.push(name);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_kotlin_type_ids(&child, source, out);
+            }
+        }
+    }
+}
+
+/// Extract simple identifier tokens from a raw type text string.
+///
+/// Used for return type text that has already been extracted as a string.
+/// Splits on non-identifier characters and returns word-like tokens.
+fn extract_type_names_from_text(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else {
+            if !current.is_empty() {
+                names.push(current.clone());
+                current.clear();
+            }
+        }
+    }
+    if !current.is_empty() {
+        names.push(current);
+    }
+    names
+}
+
+/// Returns true if `name` is a Kotlin stdlib/primitive type that should not
+/// produce a UsesType relationship.
+fn is_kotlin_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "Int"
+            | "Long"
+            | "Short"
+            | "Byte"
+            | "Float"
+            | "Double"
+            | "Boolean"
+            | "Char"
+            | "String"
+            | "Unit"
+            | "Nothing"
+            | "Any"
+            | "Number"
+            | "Comparable"
+            | "List"
+            | "Map"
+            | "Set"
+            | "MutableList"
+            | "MutableMap"
+            | "MutableSet"
+            | "Array"
+            | "Pair"
+            | "Triple"
+            | "Sequence"
+            | "Iterable"
+            | "Collection"
+    )
+}
+
+/// Emit a single UsesType relationship from `source_id` to the resolved or
+/// synthetic target UUID for `type_name`.
+fn emit_uses_type(source_id: Uuid, type_name: &str, ctx: &mut ParseContext<'_>) {
+    let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(type_name) {
+        (id, 1.0_f32)
+    } else if ctx.imported_names.contains(type_name) {
+        (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.8)
+    } else {
+        (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.5)
+    };
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id,
+        rel_type: RelationType::UsesType,
+        confidence,
+    });
 }
 
 // ---------------------------------------------------------------------------

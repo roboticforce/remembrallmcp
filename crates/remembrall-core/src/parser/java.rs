@@ -407,7 +407,154 @@ fn process_method(
         confidence: 1.0,
     });
 
+    // USES_TYPE: relationships from parameter types and return type.
+    collect_type_annotations(node, id, source, ctx);
+
     id
+}
+
+// ---------------------------------------------------------------------------
+// Type annotation extraction
+// ---------------------------------------------------------------------------
+
+/// Walk a method or constructor node's parameter list and return type,
+/// collecting `UsesType` relationships for every non-builtin type name found.
+fn collect_type_annotations(
+    method_node: &Node<'_>,
+    method_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    let mut type_names: Vec<String> = Vec::new();
+
+    // 1. Parameter types: walk `formal_parameters` -> `formal_parameter` children.
+    //    Each `formal_parameter` has a `type` field.
+    if let Some(params) = method_node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            // formal_parameter, spread_parameter, receiver_parameter
+            if let Some(type_node) = param.child_by_field_name("type") {
+                extract_type_identifiers(&type_node, source, &mut type_names);
+            }
+        }
+    }
+
+    // 2. Return type: `type` field on method_declaration (absent on constructors).
+    if let Some(return_type) = method_node.child_by_field_name("type") {
+        extract_type_identifiers(&return_type, source, &mut type_names);
+    }
+
+    // 3. Create UsesType relationships for non-builtin types.
+    for type_name in type_names {
+        if is_builtin_type(&type_name) {
+            continue;
+        }
+        let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(&type_name) {
+            (id, 1.0_f32)
+        } else if ctx.imported_names.contains(&type_name) {
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.8)
+        } else {
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.5)
+        };
+
+        ctx.result.relationships.push(Relationship {
+            source_id: method_id,
+            target_id,
+            rel_type: RelationType::UsesType,
+            confidence,
+        });
+    }
+}
+
+/// Recursively extract all type identifier names from a type node.
+///
+/// Node kinds handled:
+/// - `type_identifier`          -> push the name directly (e.g. `Order`)
+/// - `generic_type`             -> recurse (e.g. `List<Order>` yields `Order`)
+/// - `array_type`               -> recurse into the element type (e.g. `Order[]`)
+/// - `scoped_type_identifier`   -> push only the rightmost identifier component
+///                                 (e.g. `com.example.Order` -> `Order`)
+/// - everything else            -> recurse into named children
+fn extract_type_identifiers(node: &Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, source);
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        "scoped_type_identifier" => {
+            // e.g. `java.util.List` or `com.example.Foo` - use only the rightmost
+            // component because that is what appears in import simple-name lists.
+            let last_idx = node.named_child_count().saturating_sub(1) as u32;
+            if let Some(last) = node.named_child(last_idx) {
+                if last.kind() == "type_identifier" || last.kind() == "identifier" {
+                    let name = node_text(&last, source);
+                    if !name.is_empty() {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        "generic_type" => {
+            // The first named child of a generic_type is the base type_identifier
+            // (or scoped_type_identifier); the remaining children are type_arguments.
+            // Recurse into all named children so we pick up both the outer type
+            // and any type arguments (e.g. `Map<String, Order>` -> `Order`).
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_type_identifiers(&child, source, out);
+            }
+        }
+        "array_type" => {
+            // `element` field holds the component type.
+            if let Some(elem) = node.child_by_field_name("element") {
+                extract_type_identifiers(&elem, source, out);
+            } else {
+                // Fallback: recurse into all named children.
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    extract_type_identifiers(&child, source, out);
+                }
+            }
+        }
+        "type_arguments" | "wildcard" => {
+            // `<T extends Foo>` or `? extends Bar` - recurse to collect Foo/Bar.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_type_identifiers(&child, source, out);
+            }
+        }
+        _ => {
+            // Catch-all: recurse so we don't miss anything in unusual nodes.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_type_identifiers(&child, source, out);
+            }
+        }
+    }
+}
+
+/// Returns true for Java primitive types, their boxed equivalents, and the most
+/// common standard library types that are not project-specific.
+fn is_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        // Primitives
+        "int" | "long" | "short" | "byte" | "float" | "double" | "boolean" | "char" | "void"
+        // Boxed primitives + top-level types
+        | "String" | "Object" | "Integer" | "Long" | "Short" | "Byte" | "Float" | "Double"
+        | "Boolean" | "Character" | "Void" | "Class" | "Number" | "Comparable" | "Iterable"
+        // Common functional interfaces
+        | "Runnable" | "Callable"
+        // Exception hierarchy
+        | "Throwable" | "Exception" | "RuntimeException" | "Error"
+        // Common collections / utility types
+        | "List" | "Map" | "Set" | "Collection" | "ArrayList" | "HashMap" | "HashSet"
+        | "Optional" | "Stream" | "Iterator"
+        // Common annotations / meta types
+        | "Enum" | "Override" | "Deprecated" | "SuppressWarnings" | "FunctionalInterface"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -609,4 +756,159 @@ fn node_text(node: &Node<'_>, source: &[u8]) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> FileParseResult {
+        let now = chrono::Utc::now();
+        parse_java_file("Test.java", src, "test", now)
+    }
+
+    fn uses_type_rels(result: &FileParseResult) -> Vec<(uuid::Uuid, uuid::Uuid, f32)> {
+        result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .map(|r| (r.source_id, r.target_id, r.confidence))
+            .collect()
+    }
+
+    fn method_id(result: &FileParseResult, name: &str) -> Option<uuid::Uuid> {
+        result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Method && s.name == name)
+            .map(|s| s.id)
+    }
+
+    #[test]
+    fn test_uses_type_param_annotation() {
+        let src = r#"
+class OrderService {
+    public void processOrder(Order order) {}
+}
+"#;
+        let result = parse(src);
+        let rels = uses_type_rels(&result);
+        assert!(!rels.is_empty(), "expected at least one UsesType relationship");
+        let process_id = method_id(&result, "processOrder").expect("processOrder not found");
+        assert!(
+            rels.iter().any(|(src_id, _, _)| *src_id == process_id),
+            "UsesType should originate from processOrder"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_return_annotation() {
+        let src = r#"
+class UserRepository {
+    public User findById(long id) { return null; }
+}
+"#;
+        let result = parse(src);
+        let rels = uses_type_rels(&result);
+        let find_id = method_id(&result, "findById").expect("findById not found");
+        assert!(
+            rels.iter().any(|(src_id, _, _)| *src_id == find_id),
+            "UsesType should originate from findById for User return type"
+        );
+    }
+
+    #[test]
+    fn test_no_uses_type_for_builtins() {
+        let src = r#"
+class Calculator {
+    public int add(int a, int b) { return a + b; }
+    public String format(double value) { return ""; }
+}
+"#;
+        let result = parse(src);
+        // `int`, `double` are builtins - no UsesType for them.
+        // `String` is also a builtin in our list.
+        let rels = uses_type_rels(&result);
+        assert!(
+            rels.is_empty(),
+            "primitive and String types should not produce UsesType, got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_generic_type_param() {
+        let src = r#"
+class CartService {
+    public List<Product> getItems(Cart cart) { return null; }
+}
+"#;
+        let result = parse(src);
+        let rels = uses_type_rels(&result);
+        let get_id = method_id(&result, "getItems").expect("getItems not found");
+        // `List` is a builtin, but `Product` and `Cart` should produce UsesType.
+        let from_get: Vec<_> = rels.iter().filter(|(s, _, _)| *s == get_id).collect();
+        assert!(
+            from_get.len() >= 2,
+            "expected UsesType for Product and Cart (List is filtered), got {from_get:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_confidence_same_file() {
+        let src = r#"
+class Payment {}
+class PaymentService {
+    public void process(Payment p) {}
+}
+"#;
+        let result = parse(src);
+        let rels = uses_type_rels(&result);
+        let process_id = method_id(&result, "process").expect("process not found");
+        let rel = rels
+            .iter()
+            .find(|(s, _, _)| *s == process_id)
+            .expect("no UsesType from process");
+        assert_eq!(rel.2, 1.0, "same-file type should have confidence 1.0");
+    }
+
+    #[test]
+    fn test_uses_type_confidence_external() {
+        let src = r#"
+import com.example.Order;
+class ShipmentService {
+    public void ship(Order o) {}
+}
+"#;
+        let result = parse(src);
+        let rels = uses_type_rels(&result);
+        let ship_id = method_id(&result, "ship").expect("ship not found");
+        let rel = rels
+            .iter()
+            .find(|(s, _, _)| *s == ship_id)
+            .expect("no UsesType from ship");
+        assert_eq!(
+            rel.2, 0.8,
+            "imported type should have confidence 0.8"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_array_type() {
+        let src = r#"
+class FileProcessor {
+    public void process(Document[] docs) {}
+}
+"#;
+        let result = parse(src);
+        let rels = uses_type_rels(&result);
+        let proc_id = method_id(&result, "process").expect("process not found");
+        assert!(
+            rels.iter().any(|(s, _, _)| *s == proc_id),
+            "array element type Document should produce UsesType"
+        );
+    }
 }

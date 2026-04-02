@@ -344,6 +344,9 @@ fn collect_definitions<'a>(
                             confidence: 1.0,
                         });
 
+                        // USES_TYPE: type annotations on the arrow/fn value node.
+                        collect_type_annotations(&value, sym_id, source, ctx);
+
                         if let Some(body) = value.child_by_field_name("body") {
                             let mut inner = body.walk();
                             collect_definitions(&body, sym_id, None, source, ctx, &mut inner);
@@ -481,6 +484,9 @@ fn process_function_declaration(
         confidence: 1.0,
     });
 
+    // USES_TYPE: type annotations on parameters and return type.
+    collect_type_annotations(node, id, source, ctx);
+
     id
 }
 
@@ -528,6 +534,9 @@ fn process_method_definition(
         rel_type: RelationType::Defines,
         confidence: 1.0,
     });
+
+    // USES_TYPE: type annotations on parameters and return type.
+    collect_type_annotations(node, id, source, ctx);
 
     id
 }
@@ -838,6 +847,10 @@ fn process_arrow_function_or_fn_expr(
         confidence: 1.0,
     });
 
+    // USES_TYPE: type annotations on parameters and return type.
+    // The annotation nodes live on the value (arrow_function/function_expression) node.
+    collect_type_annotations(&value, id, source, ctx);
+
     if let Some(body) = value.child_by_field_name("body") {
         let mut inner = body.walk();
         collect_definitions(&body, id, None, source, ctx, &mut inner);
@@ -1026,6 +1039,192 @@ fn build_fn_signature(node: &Node<'_>, name: &str, source: &[u8], keyword: &str)
 }
 
 // ---------------------------------------------------------------------------
+// Type annotation extraction
+// ---------------------------------------------------------------------------
+
+/// Walk a function/method/arrow-function node's parameter list and return-type
+/// annotation, collecting `UsesType` relationships for every non-builtin type
+/// name found.
+fn collect_type_annotations(
+    func_node: &Node<'_>,
+    func_id: Uuid,
+    source: &[u8],
+    ctx: &mut TsParseContext<'_>,
+) {
+    let mut type_names: Vec<String> = Vec::new();
+
+    // 1. Parameter type annotations.
+    //    For `function_declaration` / `method_definition` the parameters field
+    //    is named "parameters".  For `arrow_function` it may be "parameters"
+    //    or a bare `identifier` (single-arg shorthand `x => x`).
+    if let Some(params) = func_node.child_by_field_name("parameters") {
+        collect_types_from_params(&params, source, &mut type_names);
+    }
+
+    // 2. Return type annotation: `): ReturnType`.
+    //    tree-sitter-typescript exposes this as a `type_annotation` child
+    //    accessible via the "return_type" field on function nodes.
+    if let Some(return_type) = func_node.child_by_field_name("return_type") {
+        // The return_type field value is a `type_annotation` node whose first
+        // named child is the actual type expression.
+        extract_type_identifiers(&return_type, source, &mut type_names);
+    }
+
+    // 3. Emit UsesType relationships for each non-builtin type name.
+    for type_name in type_names {
+        if is_builtin_type(&type_name) {
+            continue;
+        }
+        let (target_id, confidence) = resolve_name(&type_name, ctx);
+        ctx.result.relationships.push(Relationship {
+            source_id: func_id,
+            target_id,
+            rel_type: RelationType::UsesType,
+            confidence,
+        });
+    }
+}
+
+/// Walk a `formal_parameters` node and collect type annotation names from each
+/// typed parameter.
+fn collect_types_from_params(params: &Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        match param.kind() {
+            // `param: Type` - required or optional typed parameter
+            "required_parameter" | "optional_parameter" => {
+                if let Some(type_ann) = param.child_by_field_name("type") {
+                    extract_type_identifiers(&type_ann, source, out);
+                }
+            }
+            // `...rest: Type[]`
+            "rest_pattern" => {
+                if let Some(type_ann) = param.child_by_field_name("type") {
+                    extract_type_identifiers(&type_ann, source, out);
+                }
+            }
+            // Destructured parameter with type: `{ a, b }: Options`
+            "object_pattern" | "array_pattern" => {
+                if let Some(type_ann) = param.child_by_field_name("type") {
+                    extract_type_identifiers(&type_ann, source, out);
+                }
+            }
+            // Some grammars expose other parameter kinds - check for a type field.
+            _ => {
+                if let Some(type_ann) = param.child_by_field_name("type") {
+                    extract_type_identifiers(&type_ann, source, out);
+                }
+            }
+        }
+    }
+}
+
+/// Recursively extract all type identifier names from a type annotation node.
+///
+/// Handles:
+/// - `type_annotation` (`: SomeType`) - wrapper node, recurse into children
+/// - `type_identifier`                - simple named type like `Request`
+/// - `generic_type`                   - `Array<T>`, `Promise<T>` - extract name + type args
+/// - `union_type`, `intersection_type`- `A | B`, `A & B` - recurse into both sides
+/// - `array_type`                     - `T[]` - recurse into element type
+/// - `tuple_type`                     - `[A, B]` - recurse into element types
+/// - `predefined_type`                - builtin keyword types (`string`, `number`, etc.)
+/// - `nested_type_identifier`         - `ns.Type` - take the right-hand member part
+/// - Everything else                  - skip (literal types, index types, etc.)
+fn extract_type_identifiers(node: &Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, source);
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        "predefined_type" => {
+            // Keyword types (`string`, `number`, etc.) - push so is_builtin_type can filter.
+            let name = node_text(node, source);
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        "nested_type_identifier" => {
+            // `a.B` - only take the member (right-hand) identifier.
+            if let Some(member) = node.child_by_field_name("member") {
+                let name = node_text(&member, source);
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+        "generic_type" => {
+            // Push the base type name, then recurse into the type arguments.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(&name_node, source);
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                let mut cursor = args.walk();
+                for child in args.named_children(&mut cursor) {
+                    extract_type_identifiers(&child, source, out);
+                }
+            }
+        }
+        // Wrapper and compound nodes - recurse into named children.
+        "type_annotation"
+        | "union_type"
+        | "intersection_type"
+        | "array_type"
+        | "tuple_type"
+        | "parenthesized_type"
+        | "readonly_type"
+        | "type_predicate"
+        | "type_predicate_annotation"
+        | "mapped_type_clause"
+        | "index_type_query"
+        | "lookup_type"
+        | "conditional_type"
+        | "infer_type"
+        | "template_literal_type"
+        | "constructor_type"
+        | "function_type" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_type_identifiers(&child, source, out);
+            }
+        }
+        // Literal types (`"foo"`, `42`, `true`) and other leaf nodes - skip.
+        _ => {}
+    }
+}
+
+/// Returns `true` for TypeScript/JavaScript built-in type names that should not
+/// produce `UsesType` relationships.
+fn is_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        // Predefined keyword types
+        "string" | "number" | "boolean" | "void" | "null" | "undefined"
+            | "any" | "unknown" | "never" | "object" | "symbol" | "bigint"
+            // Global built-in constructors and utility types
+            | "Promise" | "Array" | "Map" | "Set" | "WeakMap" | "WeakSet"
+            | "Record" | "Partial" | "Required" | "Readonly" | "Pick" | "Omit"
+            | "Exclude" | "Extract" | "NonNullable" | "ReturnType" | "Parameters"
+            | "InstanceType" | "ConstructorParameters" | "Awaited"
+            | "ThisType" | "ThisParameterType" | "OmitThisParameter"
+            // Other common globals
+            | "Error" | "Date" | "RegExp" | "Function" | "Object" | "Number"
+            | "String" | "Boolean" | "Symbol" | "BigInt"
+            | "Iterable" | "Iterator" | "AsyncIterable" | "AsyncIterator"
+            | "Generator" | "AsyncGenerator" | "IterableIterator"
+            | "ReadonlyArray" | "ReadonlyMap" | "ReadonlySet"
+            | "ArrayLike" | "PropertyKey" | "EventTarget" | "EventListener"
+            // Node.js / web platform types that are effectively built-ins
+            | "Buffer" | "NodeJS" | "console"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
@@ -1036,4 +1235,169 @@ fn node_text(node: &Node<'_>, source: &[u8]) -> String {
 fn strip_quotes(s: &str) -> String {
     s.trim_matches(|c| c == '\'' || c == '"' || c == '`')
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn parse(source: &str) -> FileParseResult {
+        parse_ts_file("test.ts", source, "proj", Utc::now(), TsLang::TypeScript)
+    }
+
+    #[test]
+    fn test_no_uses_type_for_builtins() {
+        // `string`, `number`, `void`, `Promise` are all builtins - no UsesType rels.
+        let source = r#"
+function greet(name: string, count: number): void {
+    console.log(name);
+}
+async function load(id: string): Promise<void> {}
+"#;
+        let result = parse(source);
+        let rels: Vec<_> = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .collect();
+        assert!(
+            rels.is_empty(),
+            "Expected no UsesType rels for builtins, got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_param_annotation() {
+        // `Request` and `Response` are not builtins - should get UsesType rels.
+        let source = r#"
+function handle(req: Request): Response {
+    return new Response("ok");
+}
+"#;
+        let result = parse(source);
+        let rels = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .count();
+        assert_eq!(rels, 2, "Expected 2 UsesType rels (Request, Response), got: {rels}");
+    }
+
+    #[test]
+    fn test_uses_type_return_annotation() {
+        let source = r#"
+function makeUser(): User {
+    return { id: 1 };
+}
+"#;
+        let result = parse(source);
+        let rels = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .count();
+        assert_eq!(rels, 1, "Expected 1 UsesType rel (User), got: {rels}");
+    }
+
+    #[test]
+    fn test_uses_type_generic_param() {
+        // `Array<User>` should yield a UsesType for `User` but not `Array`.
+        let source = r#"
+function getUsers(): Array<User> {
+    return [];
+}
+"#;
+        let result = parse(source);
+        let rels: Vec<_> = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .collect();
+        // Array is builtin, User is not - expect exactly 1.
+        assert_eq!(rels.len(), 1, "Expected 1 UsesType rel (User only), got: {}", rels.len());
+    }
+
+    #[test]
+    fn test_uses_type_method() {
+        let source = r#"
+class OrderService {
+    process(order: Order): Result {
+        return { ok: true };
+    }
+}
+"#;
+        let result = parse(source);
+        let rels = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .count();
+        assert_eq!(rels, 2, "Expected 2 UsesType rels (Order, Result) for method, got: {rels}");
+    }
+
+    #[test]
+    fn test_uses_type_arrow_function() {
+        let source = r#"
+const transform = (input: InputType): OutputType => {
+    return input as unknown as OutputType;
+};
+"#;
+        let result = parse(source);
+        let rels = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .count();
+        assert_eq!(
+            rels, 2,
+            "Expected 2 UsesType rels (InputType, OutputType) for arrow fn, got: {rels}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_confidence_same_file() {
+        // When a type is defined in the same file it should have confidence 1.0.
+        let source = r#"
+interface Config {}
+function init(config: Config): void {}
+"#;
+        let result = parse(source);
+        let config_rel = result
+            .relationships
+            .iter()
+            .find(|r| r.rel_type == RelationType::UsesType);
+        assert!(config_rel.is_some(), "Expected a UsesType rel for Config");
+        let confidence = config_rel.unwrap().confidence;
+        assert!(
+            (confidence - 1.0).abs() < f32::EPSILON,
+            "Config is defined in same file, expected confidence 1.0, got {confidence}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_confidence_external() {
+        // Unknown external type gets confidence 0.5.
+        let source = r#"
+function handle(req: ExternalRequest): ExternalResponse {}
+"#;
+        let result = parse(source);
+        let rels: Vec<_> = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .collect();
+        for rel in &rels {
+            assert!(
+                (rel.confidence - 0.5).abs() < f32::EPSILON,
+                "Unknown type should have confidence 0.5, got {}",
+                rel.confidence
+            );
+        }
+        assert_eq!(rels.len(), 2, "Expected 2 UsesType rels, got {}", rels.len());
+    }
 }

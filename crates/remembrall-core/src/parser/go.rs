@@ -14,6 +14,7 @@
 //! - `call_expression`    -> RelationType::Calls
 //! - Struct/interface embedding -> RelationType::Inherits
 //! - Receiver type defines method -> RelationType::Defines
+//! - Function/method parameter and return types -> RelationType::UsesType
 
 use std::collections::{HashMap, HashSet};
 
@@ -85,6 +86,10 @@ pub fn parse_go_file(
     // Pass 3: collect call expressions.
     let mut cursor3 = root.walk();
     collect_calls(&root, source_bytes, &mut ctx, &mut cursor3);
+
+    // Pass 4: collect type annotations from function/method signatures.
+    let mut cursor4 = root.walk();
+    collect_type_annotations(&root, source_bytes, &mut ctx, &mut cursor4);
 
     ctx.result
 }
@@ -594,6 +599,174 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Opti
     }
 
     best.map(|(id, _)| id)
+}
+
+// ---------------------------------------------------------------------------
+// Type annotation collection
+// ---------------------------------------------------------------------------
+
+/// Walk top-level function and method declarations and emit UsesType
+/// relationships for each non-builtin type referenced in parameters and
+/// return types.
+fn collect_type_annotations<'a>(
+    node: &Node<'a>,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+    cursor: &mut TreeCursor<'a>,
+) {
+    for child in node.children(cursor) {
+        match child.kind() {
+            "function_declaration" | "method_declaration" => {
+                process_func_type_annotations(&child, source, ctx);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Emit UsesType relationships for all non-builtin types found in a function
+/// or method's parameter list and return type.
+fn process_func_type_annotations(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let func_id = {
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, source))
+            .unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        // For methods the map key is "ReceiverType.MethodName"; for functions it is just the name.
+        let receiver_type = node
+            .child_by_field_name("receiver")
+            .and_then(|recv| extract_receiver_type(&recv, source));
+        let key = if let Some(ref rt) = receiver_type {
+            format!("{rt}.{name}")
+        } else {
+            name
+        };
+        match ctx.name_to_id.get(&key).copied() {
+            Some(id) => id,
+            None => return,
+        }
+    };
+
+    // Collect types from the parameter list.
+    if let Some(params_node) = node.child_by_field_name("parameters") {
+        for type_name in extract_type_identifiers(&params_node, source) {
+            emit_uses_type(func_id, &type_name, ctx);
+        }
+    }
+
+    // Collect types from the return type (the `result` field).
+    if let Some(result_node) = node.child_by_field_name("result") {
+        for type_name in extract_type_identifiers(&result_node, source) {
+            emit_uses_type(func_id, &type_name, ctx);
+        }
+    }
+}
+
+/// Recursively extract all named type identifiers from a node subtree.
+///
+/// Handles:
+/// - `type_identifier`  - plain named type: `MyType`
+/// - `qualified_type`   - package-qualified: `http.ResponseWriter` (last segment only)
+/// - `pointer_type`     - `*MyType` (recurse into element)
+/// - `slice_type`       - `[]MyType` (recurse into element)
+/// - `map_type`         - `map[K]V` (recurse into key and value fields)
+/// - `channel_type`     - `chan MyType` (recurse)
+fn extract_type_identifiers(node: &Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut result = Vec::new();
+    collect_type_ids_recursive(node, source, &mut result);
+    result
+}
+
+fn collect_type_ids_recursive(node: &Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, source);
+            if !name.is_empty() && !is_go_builtin(&name) {
+                out.push(name);
+            }
+        }
+        "qualified_type" => {
+            // `pkg.TypeName` - use only the last dotted segment.
+            let full = node_text(node, source);
+            let name = full.split('.').last().unwrap_or(&full).trim().to_string();
+            if !name.is_empty() && !is_go_builtin(&name) {
+                out.push(name);
+            }
+        }
+        "pointer_type" | "slice_type" | "channel_type" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_ids_recursive(&child, source, out);
+            }
+        }
+        "map_type" => {
+            if let Some(key) = node.child_by_field_name("key") {
+                collect_type_ids_recursive(&key, source, out);
+            }
+            if let Some(val) = node.child_by_field_name("value") {
+                collect_type_ids_recursive(&val, source, out);
+            }
+        }
+        _ => {
+            // Descend into parameter_declaration, parameter_list, result, etc.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_ids_recursive(&child, source, out);
+            }
+        }
+    }
+}
+
+/// Returns true if `name` is a Go primitive or builtin that should not
+/// produce a UsesType relationship.
+fn is_go_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "byte"
+            | "rune"
+            | "string"
+            | "bool"
+            | "error"
+            | "any"
+            | "comparable"
+            | "uintptr"
+    )
+}
+
+/// Emit a single UsesType relationship from `source_id` to the resolved or
+/// synthetic target UUID for `type_name`.
+fn emit_uses_type(source_id: Uuid, type_name: &str, ctx: &mut ParseContext<'_>) {
+    let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(type_name) {
+        (id, 1.0_f32)
+    } else if ctx.imported_names.contains(type_name) {
+        (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.8)
+    } else {
+        (Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()), 0.5)
+    };
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id,
+        rel_type: RelationType::UsesType,
+        confidence,
+    });
 }
 
 // ---------------------------------------------------------------------------

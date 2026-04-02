@@ -404,6 +404,11 @@ fn process_adt(
         confidence: 1.0,
     });
 
+    // USES_TYPE: struct field types.
+    if keyword == "struct" {
+        collect_type_annotations(node, id, source, ctx);
+    }
+
     id
 }
 
@@ -629,6 +634,9 @@ fn process_function(
             confidence: 1.0,
         });
     }
+
+    // USES_TYPE: relationships from type annotations on parameters and return type.
+    collect_type_annotations(node, id, source, ctx);
 
     id
 }
@@ -1019,6 +1027,205 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Opti
 }
 
 // ---------------------------------------------------------------------------
+// Type annotation extraction
+// ---------------------------------------------------------------------------
+
+/// Walk a function node's parameter list and return-type annotation, collecting
+/// `UsesType` relationships for every non-builtin type name found.
+///
+/// Also handles struct field types when `func_node` is a `struct_item`.
+fn collect_type_annotations(
+    func_node: &Node<'_>,
+    func_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    let mut type_names: Vec<String> = Vec::new();
+
+    // 1. Parameter type annotations.
+    if let Some(params) = func_node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            // Skip `self` and `&self` / `&mut self` parameters.
+            if param.kind() == "self_parameter" {
+                continue;
+            }
+            if let Some(type_node) = param.child_by_field_name("type") {
+                extract_type_identifiers(&type_node, source, &mut type_names);
+            }
+        }
+    }
+
+    // 2. Return type annotation.
+    if let Some(return_type) = func_node.child_by_field_name("return_type") {
+        extract_type_identifiers(&return_type, source, &mut type_names);
+    }
+
+    // 3. Struct field types (when the node is a struct_item).
+    if func_node.kind() == "struct_item" {
+        if let Some(body) = func_node.child_by_field_name("body") {
+            let mut cursor = body.walk();
+            for field in body.named_children(&mut cursor) {
+                if field.kind() == "field_declaration" {
+                    if let Some(type_node) = field.child_by_field_name("type") {
+                        extract_type_identifiers(&type_node, source, &mut type_names);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Emit UsesType relationships for all collected non-builtin types.
+    // Deduplicate before emitting.
+    let mut seen: HashSet<String> = HashSet::new();
+    for type_name in type_names {
+        if is_builtin_rust_type(&type_name) {
+            continue;
+        }
+        if !seen.insert(type_name.clone()) {
+            continue;
+        }
+        let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(&type_name) {
+            (id, 1.0_f32)
+        } else if ctx.imported_names.contains(&type_name) {
+            (
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()),
+                0.8,
+            )
+        } else {
+            (
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, type_name.as_bytes()),
+                0.5,
+            )
+        };
+
+        ctx.result.relationships.push(Relationship {
+            source_id: func_id,
+            target_id,
+            rel_type: RelationType::UsesType,
+            confidence,
+        });
+    }
+}
+
+/// Recursively collect all type identifier names from a type node.
+///
+/// Handles:
+/// - `type_identifier`          -> push the name directly
+/// - `generic_type`             -> push the outer name, recurse into type arguments
+/// - `reference_type`           -> recurse into the inner `type` field
+/// - `scoped_type_identifier`   -> push the last segment (`name` field)
+/// - `dynamic_type`             -> recurse into the `trait` field
+/// - everything else            -> recurse into named children
+fn extract_type_identifiers(node: &Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, source);
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        "scoped_type_identifier" => {
+            // `module::Type` - only record the last segment.
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, source))
+                .unwrap_or_else(|| {
+                    let text = node_text(node, source);
+                    text.split("::").last().unwrap_or("").to_string()
+                });
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        "generic_type" => {
+            // `Vec<SomeType>` - push the outer name and recurse into arguments.
+            if let Some(base) = node.child_by_field_name("type") {
+                extract_type_identifiers(&base, source, out);
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                let mut cursor = args.walk();
+                for arg in args.named_children(&mut cursor) {
+                    extract_type_identifiers(&arg, source, out);
+                }
+            }
+        }
+        "reference_type" => {
+            // `&SomeType` or `&mut SomeType`
+            if let Some(inner) = node.child_by_field_name("type") {
+                extract_type_identifiers(&inner, source, out);
+            }
+        }
+        "dynamic_type" => {
+            // `dyn Trait`
+            if let Some(trait_node) = node.child_by_field_name("trait") {
+                extract_type_identifiers(&trait_node, source, out);
+            }
+        }
+        "tuple_type" | "array_type" | "slice_type" | "pointer_type"
+        | "abstract_type" | "bounded_type" => {
+            // Recurse into all named children.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_type_identifiers(&child, source, out);
+            }
+        }
+        _ => {
+            // Fallback: recurse.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_type_identifiers(&child, source, out);
+            }
+        }
+    }
+}
+
+/// Returns `true` for Rust primitive types, standard library containers,
+/// and other pervasive types that should not generate `UsesType` relationships.
+fn is_builtin_rust_type(name: &str) -> bool {
+    matches!(
+        name,
+        "str"
+            | "String"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "usize"
+            | "isize"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "Box"
+            | "Rc"
+            | "Arc"
+            | "Cell"
+            | "RefCell"
+            | "Pin"
+            | "HashMap"
+            | "HashSet"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "VecDeque"
+            | "LinkedList"
+            | "BinaryHeap"
+            | "Cow"
+            | "PhantomData"
+            | "Self"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Signature building
 // ---------------------------------------------------------------------------
 
@@ -1103,4 +1310,223 @@ fn extract_type_name(node: &Node<'_>, source: &[u8]) -> String {
 
 fn node_text(node: &Node<'_>, source: &[u8]) -> String {
     node.utf8_text(source).unwrap_or("").trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn parse(source: &str) -> FileParseResult {
+        parse_rust_file("test.rs", source, "proj", Utc::now())
+    }
+
+    fn uses_type_rels(result: &FileParseResult) -> Vec<&Relationship> {
+        result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::UsesType)
+            .collect()
+    }
+
+    #[test]
+    fn test_no_uses_type_for_builtins() {
+        // Primitive and standard-library types should produce no UsesType rels.
+        let source = r#"
+fn process(x: i32, name: String, flag: bool) -> Vec<u8> {
+    Vec::new()
+}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert!(
+            rels.is_empty(),
+            "Expected no UsesType rels for builtins, got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_param_annotation() {
+        // Custom types in parameter position should emit UsesType.
+        let source = r#"
+fn handle(req: HttpRequest, db: Database) {}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert_eq!(
+            rels.len(),
+            2,
+            "Expected 2 UsesType rels (HttpRequest, Database), got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_return_annotation() {
+        // Custom return type should emit a UsesType rel.
+        let source = r#"
+fn make_controller() -> Controller {
+    Controller::new()
+}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert_eq!(
+            rels.len(),
+            1,
+            "Expected 1 UsesType rel (Controller), got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_reference_param() {
+        // `&SomeType` should unwrap the reference and emit UsesType for the inner type.
+        let source = r#"
+fn render(view: &View) -> Html {}
+"#;
+        let result = parse(source);
+        let type_names: Vec<_> = uses_type_rels(&result)
+            .iter()
+            .map(|r| r.target_id)
+            .collect();
+        assert_eq!(
+            type_names.len(),
+            2,
+            "Expected 2 UsesType rels (&View, Html), got: {type_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_generic_param() {
+        // Types nested inside generics (e.g. `Option<Controller>`) should be extracted.
+        let source = r#"
+fn find(id: u32) -> Option<Controller> {
+    None
+}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        // Option is a builtin and should be skipped; Controller should be extracted.
+        assert_eq!(
+            rels.len(),
+            1,
+            "Expected 1 UsesType rel (Controller, not Option), got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_confidence_same_file() {
+        // When the target type is defined in the same file, confidence should be 1.0.
+        let source = r#"
+struct Controller {}
+
+fn make() -> Controller {
+    Controller {}
+}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert_eq!(rels.len(), 1, "Expected 1 UsesType rel, got: {rels:?}");
+        assert!(
+            (rels[0].confidence - 1.0).abs() < f32::EPSILON,
+            "Same-file type should have confidence 1.0, got {}",
+            rels[0].confidence
+        );
+    }
+
+    #[test]
+    fn test_uses_type_confidence_imported() {
+        // When the target type is imported, confidence should be 0.8.
+        let source = r#"
+use some_crate::ExternalType;
+
+fn process(val: ExternalType) {}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert_eq!(rels.len(), 1, "Expected 1 UsesType rel, got: {rels:?}");
+        assert!(
+            (rels[0].confidence - 0.8).abs() < f32::EPSILON,
+            "Imported type should have confidence 0.8, got {}",
+            rels[0].confidence
+        );
+    }
+
+    #[test]
+    fn test_uses_type_confidence_external() {
+        // An unknown (neither defined nor imported) type gets confidence 0.5.
+        let source = r#"
+fn process(val: UnknownType) -> AnotherUnknown {}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert_eq!(rels.len(), 2, "Expected 2 UsesType rels, got: {rels:?}");
+        for rel in &rels {
+            assert!(
+                (rel.confidence - 0.5).abs() < f32::EPSILON,
+                "Unknown type should have confidence 0.5, got {}",
+                rel.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn test_uses_type_method() {
+        // Methods should also emit UsesType for annotated parameter and return types.
+        let source = r#"
+struct Server {}
+
+impl Server {
+    fn handle(&self, req: HttpRequest) -> HttpResponse {
+        HttpResponse::ok()
+    }
+}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        // `&self` is skipped; HttpRequest and HttpResponse should be extracted.
+        assert_eq!(
+            rels.len(),
+            2,
+            "Expected 2 UsesType rels (HttpRequest, HttpResponse), got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_uses_type_struct_fields() {
+        // Struct field types should emit UsesType from the struct symbol.
+        let source = r#"
+struct App {
+    db: Database,
+    config: AppConfig,
+    count: u32,
+}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        // u32 is a builtin - only Database and AppConfig should be extracted.
+        assert_eq!(
+            rels.len(),
+            2,
+            "Expected 2 UsesType rels (Database, AppConfig), got: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_duplicate_uses_type() {
+        // The same type referenced multiple times should only produce one UsesType rel.
+        let source = r#"
+fn process(a: Controller, b: Controller) {}
+"#;
+        let result = parse(source);
+        let rels = uses_type_rels(&result);
+        assert_eq!(
+            rels.len(),
+            1,
+            "Duplicate UsesType for same type should be deduplicated, got: {rels:?}"
+        );
+    }
 }
