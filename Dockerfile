@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Builder ────────────────────────────────────────────────────────────────────
-FROM rust:1.84.1-bookworm AS builder
+FROM rust:1.88.0-bookworm AS builder
 
 # System packages needed at build time:
 #   pkg-config + libssl-dev  - OpenSSL linkage for sqlx / reqwest

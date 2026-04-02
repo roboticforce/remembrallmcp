@@ -2,13 +2,16 @@
 name = "remembrall-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "MCP server for RemembrallMCP - persistent memory and code intelligence for AI agents"
+repository = "https://github.com/cdnsteve/remembrallmcp"
 
 [[bin]]
 name = "remembrall"
 path = "src/main.rs"
 
 [dependencies]
-remembrall-core = { path = "../remembrall-core" }
+remembrall-core = { version = "=0.1.0", path = "../remembrall-core" }
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 sqlx = { workspace = true }

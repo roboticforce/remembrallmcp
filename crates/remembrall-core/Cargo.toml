@@ -2,6 +2,9 @@
 name = "remembrall-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Persistent knowledge memory and code dependency graph for AI agents"
+repository = "https://github.com/cdnsteve/remembrallmcp"
 
 [[bin]]
 name = "spike"
