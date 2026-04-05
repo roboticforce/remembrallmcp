@@ -142,6 +142,145 @@ impl GraphStore {
         Ok(id)
     }
 
+    /// Insert or update a batch of symbols. Processes in chunks of 500.
+    pub async fn upsert_symbols_batch(&self, symbols: &[Symbol]) -> Result<()> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in symbols.chunks(500) {
+            // Build: INSERT INTO schema.symbols (col, ...) VALUES ($1,$2,...), ($N,...) ON CONFLICT ...
+            let mut query_str = format!(
+                "INSERT INTO {schema}.symbols \
+                 (id, name, symbol_type, file_path, start_line, end_line, language, project, signature, file_mtime, layer) \
+                 VALUES ",
+                schema = self.schema,
+            );
+
+            let cols_per_row: usize = 11;
+            for (i, _) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query_str.push_str(", ");
+                }
+                let base = i * cols_per_row + 1;
+                query_str.push_str(&format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9,
+                    base + 10,
+                ));
+            }
+
+            query_str.push_str(
+                " ON CONFLICT (id) DO UPDATE SET \
+                 name = EXCLUDED.name, \
+                 symbol_type = EXCLUDED.symbol_type, \
+                 start_line = EXCLUDED.start_line, \
+                 end_line = EXCLUDED.end_line, \
+                 signature = EXCLUDED.signature, \
+                 file_mtime = EXCLUDED.file_mtime, \
+                 layer = EXCLUDED.layer",
+            );
+
+            let mut query = sqlx::query(&query_str);
+            for sym in chunk {
+                let symbol_type = sym.symbol_type.to_string();
+                query = query
+                    .bind(sym.id)
+                    .bind(&sym.name)
+                    .bind(symbol_type)
+                    .bind(&sym.file_path)
+                    .bind(sym.start_line)
+                    .bind(sym.end_line)
+                    .bind(&sym.language)
+                    .bind(&sym.project)
+                    .bind(&sym.signature)
+                    .bind(sym.file_mtime)
+                    .bind(&sym.layer);
+            }
+            query.execute(&self.pool).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Insert or update a batch of relationships. Processes in chunks of 1000.
+    /// Relationships with unknown source/target IDs or self-references are skipped.
+    pub async fn add_relationships_batch(&self, rels: &[Relationship]) -> Result<()> {
+        if rels.is_empty() {
+            return Ok(());
+        }
+
+        // Collect all known symbol IDs to filter out FK violations before batching.
+        let known_ids: std::collections::HashSet<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+            &format!("SELECT id FROM {schema}.symbols", schema = self.schema),
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(id,)| id)
+        .collect();
+
+        for chunk in rels.chunks(1000) {
+            // Filter self-references, unknown IDs, and deduplicate within the chunk.
+            let mut seen = std::collections::HashSet::new();
+            let filtered: Vec<&Relationship> = chunk
+                .iter()
+                .filter(|r| r.source_id != r.target_id)
+                .filter(|r| known_ids.contains(&r.source_id) && known_ids.contains(&r.target_id))
+                .filter(|r| seen.insert((r.source_id, r.target_id, r.rel_type.to_string())))
+                .collect();
+
+            if filtered.is_empty() {
+                continue;
+            }
+
+            let mut query_str = format!(
+                "INSERT INTO {schema}.relationships (source_id, target_id, rel_type, confidence) VALUES ",
+                schema = self.schema,
+            );
+
+            for (i, _) in filtered.iter().enumerate() {
+                if i > 0 {
+                    query_str.push_str(", ");
+                }
+                let base = i * 4 + 1;
+                query_str.push_str(&format!(
+                    "(${}, ${}, ${}, ${})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                ));
+            }
+
+            query_str.push_str(
+                " ON CONFLICT (source_id, target_id, rel_type) DO UPDATE SET \
+                 confidence = EXCLUDED.confidence",
+            );
+
+            let mut query = sqlx::query(&query_str);
+            for rel in &filtered {
+                query = query
+                    .bind(rel.source_id)
+                    .bind(rel.target_id)
+                    .bind(rel.rel_type.to_string())
+                    .bind(rel.confidence);
+            }
+            query.execute(&self.pool).await?;
+        }
+
+        Ok(())
+    }
+
     /// Add a relationship between two symbols.
     pub async fn add_relationship(&self, rel: &Relationship) -> Result<()> {
         let rel_type = rel.rel_type.to_string();

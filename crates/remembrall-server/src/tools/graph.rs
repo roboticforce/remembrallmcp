@@ -87,24 +87,18 @@ pub async fn index_impl(
     .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
     .map_err(|e| McpError::internal_error(format!("index_directory failed: {e}"), None))?;
 
-    let mut symbols_stored = 0u64;
-    let mut relationships_stored = 0u64;
+    graph_arc
+        .upsert_symbols_batch(&index_result.symbols)
+        .await
+        .map_err(|e| McpError::internal_error(format!("upsert_symbols_batch failed: {e}"), None))?;
 
-    for symbol in &index_result.symbols {
-        graph_arc
-            .upsert_symbol(symbol)
-            .await
-            .map_err(|e| McpError::internal_error(format!("upsert_symbol failed: {e}"), None))?;
-        symbols_stored += 1;
-    }
+    graph_arc
+        .add_relationships_batch(&index_result.relationships)
+        .await
+        .map_err(|e| McpError::internal_error(format!("add_relationships_batch failed: {e}"), None))?;
 
-    for rel in &index_result.relationships {
-        if let Err(e) = graph_arc.add_relationship(rel).await {
-            tracing::debug!("skipping unresolvable relationship: {e}");
-        } else {
-            relationships_stored += 1;
-        }
-    }
+    let symbols_stored = index_result.symbols.len() as u64;
+    let relationships_stored = index_result.relationships.len() as u64;
 
     let canonical = std::path::Path::new(&path)
         .canonicalize()

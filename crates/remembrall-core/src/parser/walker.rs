@@ -570,5 +570,14 @@ fn should_skip(path: &Path) -> bool {
             | "vendor"
             | "venv"
             | ".venv"
+            | "log"
+            | "logs"
+            | "tmp"
+            | "coverage"
+            | "public"
+            | "storage"
+            | ".bundle"
+            | "e2e"
+            | "playwright-report"
     )
 }

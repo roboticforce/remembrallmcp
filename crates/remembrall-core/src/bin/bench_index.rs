@@ -41,16 +41,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let store_start = Instant::now();
-    for symbol in &result.symbols {
-        graph.upsert_symbol(symbol).await?;
-    }
-    let mut rels_stored = 0u64;
-    for rel in &result.relationships {
-        if graph.add_relationship(rel).await.is_ok() {
-            rels_stored += 1;
-        }
-    }
-    println!("Relationships stored: {rels_stored}/{}", result.relationships.len());
+    graph.upsert_symbols_batch(&result.symbols).await?;
+    graph.add_relationships_batch(&result.relationships).await?;
+    let rels_stored = result.relationships.len();
+    println!("Relationships stored: {rels_stored}/{rels_stored}");
     let store_time = store_start.elapsed();
 
     println!("Stored in {:.1}s. Done.", store_time.as_secs_f64());
