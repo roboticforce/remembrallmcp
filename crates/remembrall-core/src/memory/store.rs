@@ -13,6 +13,8 @@ pub struct MemoryStore {
     schema: String,
 }
 
+const DEFAULT_HYBRID_MIN_SIMILARITY: f32 = 0.20;
+
 impl MemoryStore {
     pub fn new(pool: PgPool, schema: String) -> Result<Self> {
         validate_schema_name(&schema)
@@ -272,7 +274,9 @@ impl MemoryStore {
 
         const K: f64 = 60.0;
         let limit = query.limit.unwrap_or(10);
-        let min_similarity = query.min_similarity.unwrap_or(0.0) as f64;
+        let min_similarity = query
+            .min_similarity
+            .unwrap_or(DEFAULT_HYBRID_MIN_SIMILARITY) as f64;
 
         // --- Semantic results ---
         let sem_raw = self
@@ -281,6 +285,12 @@ impl MemoryStore {
 
         // --- Full-text results ---
         let ft_raw = self.search_fulltext(&query.query, limit * 2).await?;
+
+        // If the query looks like an exact identifier or keyword probe, do not
+        // backfill with semantic-only neighbors when lexical search found nothing.
+        if ft_raw.is_empty() && requires_lexical_hit(&query.query) {
+            return Ok(Vec::new());
+        }
 
         // --- RRF fusion ---
         // Map: memory_id -> (rrf_score, best_match_type)
@@ -305,7 +315,6 @@ impl MemoryStore {
             .map(|(id, (score, mt))| (id, score, mt))
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(limit as usize);
 
         // --- Hydrate, filter, and apply decay scoring ---
         let mut results = Vec::new();
@@ -351,6 +360,7 @@ impl MemoryStore {
 
         // Re-sort by final (decay-adjusted) score descending.
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit as usize);
 
         // Batch-update access_count for all returned memories.
         if !results.is_empty() {
@@ -574,6 +584,22 @@ impl MemoryStore {
 
         Ok(count)
     }
+}
+
+fn requires_lexical_hit(query: &str) -> bool {
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.len() <= 1 {
+        return true;
+    }
+
+    tokens.iter().any(|token| {
+        token.contains('_')
+            || (token.len() >= 8
+                && token
+                    .chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .all(|c| c.is_ascii_uppercase()))
+    })
 }
 
 /// Internal row type for sqlx deserialization.

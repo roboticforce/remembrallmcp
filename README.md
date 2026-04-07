@@ -55,6 +55,8 @@ The savings compound on larger codebases. Click is ~90 files - on a 500+ file mo
 
 Run the benchmarks yourself: see [`benchmarks/`](benchmarks/) for the harness and task definitions.
 
+For the broader benchmark strategy across memory retrieval, long-horizon memory, code graph correctness, and agent productivity, see [`docs/benchmark-roadmap.md`](docs/benchmark-roadmap.md).
+
 ## Requirements
 
 - Docker (for the easiest setup) or PostgreSQL 16 with [pgvector](https://github.com/pgvector/pgvector)

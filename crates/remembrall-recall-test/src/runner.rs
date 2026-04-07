@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use remembrall_core::embed::Embedder;
 use remembrall_core::memory::store::MemoryStore;
-use remembrall_core::memory::types::{MemoryQuery, MemoryType, Scope};
+use remembrall_core::memory::types::{MatchType, MemoryQuery, MemorySearchResult, MemoryType, Scope};
 
 use crate::ground_truth::QueryCase;
 use crate::scorer::{self, QueryScore};
@@ -64,8 +64,11 @@ pub async fn run_query(
     // Generate query embedding
     let embedding = remembrall_core::tokio_block_on_embed(embedder, &case.query)?;
 
-    // Execute hybrid search
-    let search_result = store.search_hybrid(embedding, &mq).await;
+    let search_result: Result<Vec<MemorySearchResult>> = match case.method.as_str() {
+        "semantic" => run_semantic_query(store, &embedding, &mq).await,
+        "fulltext" => run_fulltext_query(store, &mq).await,
+        _ => store.search_hybrid(embedding, &mq).await.map_err(Into::into),
+    };
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
 
@@ -170,4 +173,83 @@ pub async fn run_query(
             })
         }
     }
+}
+
+async fn run_semantic_query(
+    store: &MemoryStore,
+    embedding: &[f32],
+    query: &MemoryQuery,
+) -> Result<Vec<MemorySearchResult>> {
+    let rows = store
+        .search_semantic(
+            embedding.to_vec(),
+            query.limit.unwrap_or(20),
+            query.min_similarity.unwrap_or(0.0) as f64,
+            query.scope.as_ref(),
+        )
+        .await?;
+
+    hydrate_and_filter_results(store, rows, query, MatchType::Semantic).await
+}
+
+async fn run_fulltext_query(
+    store: &MemoryStore,
+    query: &MemoryQuery,
+) -> Result<Vec<MemorySearchResult>> {
+    let rows = store
+        .search_fulltext(&query.query, query.limit.unwrap_or(20))
+        .await?;
+
+    hydrate_and_filter_results(store, rows, query, MatchType::FullText).await
+}
+
+async fn hydrate_and_filter_results(
+    store: &MemoryStore,
+    rows: Vec<(Uuid, f64)>,
+    query: &MemoryQuery,
+    match_type: MatchType,
+) -> Result<Vec<MemorySearchResult>> {
+    let mut results = Vec::new();
+
+    for (id, score) in rows {
+        let memory = match store.get_readonly(id).await {
+            Ok(memory) => memory,
+            Err(_) => continue,
+        };
+
+        if let Some(ref types) = query.memory_types {
+            if !types.iter().any(|t| t.to_string() == memory.memory_type.to_string()) {
+                continue;
+            }
+        }
+
+        if let Some(ref req_tags) = query.tags {
+            if !req_tags.iter().all(|t| memory.tags.contains(t)) {
+                continue;
+            }
+        }
+
+        if let Some(ref scope) = query.scope {
+            if scope.project.is_some() && scope.project != memory.scope.project {
+                continue;
+            }
+            if scope.team.is_some() && scope.team != memory.scope.team {
+                continue;
+            }
+            if scope.organization.is_some() && scope.organization != memory.scope.organization {
+                continue;
+            }
+        }
+
+        results.push(MemorySearchResult {
+            memory,
+            score: score as f32,
+            match_type: match_type.clone(),
+        });
+    }
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(query.limit.unwrap_or(20) as usize);
+
+    Ok(results)
 }
