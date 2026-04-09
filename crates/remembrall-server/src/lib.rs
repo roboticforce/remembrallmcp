@@ -86,7 +86,7 @@ impl RemembrallServer {
         tools::memory::delete_impl(&self.memory, params).await
     }
 
-    #[tool(description = "Index a project directory to build the code graph. Must be run before impact analysis or symbol lookup. Supports Python, TypeScript, and JavaScript files.")]
+    #[tool(description = "Index a project directory to build the code graph. Must be run before impact analysis or symbol lookup. Supports Python, TypeScript, JavaScript, Rust, Go, Ruby, Java, and Kotlin.")]
     async fn remembrall_index(
         &self,
         Parameters(params): Parameters<IndexParams>,
