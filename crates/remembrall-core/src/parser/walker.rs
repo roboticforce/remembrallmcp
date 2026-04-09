@@ -14,7 +14,7 @@
 //! `mtime` is newer will be parsed. The mtime is stored on every `Symbol` so
 //! the graph store can cheaply determine which symbols need replacement.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -258,14 +258,76 @@ pub fn index_directory(
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Phase 2c: derive Import edges from cross-file relationships.
+    // ---------------------------------------------------------------------------
+    // Languages with autoloading (e.g., Ruby/Rails with Zeitwerk) may not have
+    // explicit import statements. We supplement by deriving Import edges: if a
+    // symbol in file A has a resolved Inherits, Calls, or UsesType edge pointing
+    // at a symbol in file B, we add an Imports edge from file A to file B.
+
+    let sym_to_file: HashMap<Uuid, &str> = result
+        .symbols
+        .iter()
+        .map(|s| (s.id, s.file_path.as_str()))
+        .collect();
+
+    let file_to_sym: HashMap<&str, Uuid> = result
+        .symbols
+        .iter()
+        .filter(|s| s.symbol_type == SymbolType::File)
+        .map(|s| (s.file_path.as_str(), s.id))
+        .collect();
+
+    let mut import_pairs: HashSet<(Uuid, Uuid)> = result
+        .relationships
+        .iter()
+        .filter(|r| r.rel_type == RelationType::Imports)
+        .map(|r| (r.source_id, r.target_id))
+        .collect();
+
+    let mut derived_imports = Vec::new();
+    for rel in &result.relationships {
+        if !matches!(
+            rel.rel_type,
+            RelationType::Inherits | RelationType::Calls | RelationType::UsesType
+        ) {
+            continue;
+        }
+        let src_file = sym_to_file
+            .get(&rel.source_id)
+            .and_then(|fp| file_to_sym.get(fp))
+            .copied();
+        let tgt_file = sym_to_file
+            .get(&rel.target_id)
+            .and_then(|fp| file_to_sym.get(fp))
+            .copied();
+
+        if let (Some(sf), Some(tf)) = (src_file, tgt_file) {
+            if sf != tf && !import_pairs.contains(&(sf, tf)) {
+                import_pairs.insert((sf, tf));
+                derived_imports.push(Relationship {
+                    source_id: sf,
+                    target_id: tf,
+                    rel_type: RelationType::Imports,
+                    confidence: 0.6,
+                });
+            }
+        }
+    }
+
+    let derived_count = derived_imports.len();
+    result.relationships.extend(derived_imports);
+
     tracing::info!(
-        "Indexed {} - {} files parsed, {} skipped, {} symbols, {} relationships ({} imports resolved)",
+        "Indexed {} - {} files parsed, {} skipped, {} symbols, {} relationships ({} imports resolved, {} derived)",
         root_dir.display(),
         result.files_parsed,
         result.files_skipped,
         result.symbols.len(),
         result.relationships.len(),
         resolved_count,
+        derived_count,
     );
 
     Ok(result)

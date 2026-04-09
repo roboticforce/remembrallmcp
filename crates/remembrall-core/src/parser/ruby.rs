@@ -207,6 +207,65 @@ fn snake_to_camel(s: &str) -> String {
         .collect()
 }
 
+/// Convert a CamelCase string to snake_case.
+/// `"ApplicationController"` -> `"application_controller"`.
+fn camel_to_snake(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            result.push('_');
+        }
+        result.extend(c.to_lowercase());
+    }
+    result
+}
+
+/// Convert a Ruby constant path to a Zeitwerk-style file path.
+/// `"Api::V1::CandidatesController"` -> `"api/v1/candidates_controller"`.
+fn zeitwerk_path(constant: &str) -> String {
+    constant
+        .split("::")
+        .map(|seg| camel_to_snake(seg))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Generate a synthetic `RawImport` for a Zeitwerk-autoloaded constant.
+///
+/// Rails uses Zeitwerk which maps constant names to file paths by convention:
+/// `SomeModule::SomeClass` -> `some_module/some_class.rb`. Since Ruby/Rails
+/// has no explicit import statements, we infer them so the walker can resolve
+/// file-to-file Import edges.
+fn emit_zeitwerk_import(constant: &str, ctx: &mut ParseContext<'_>) {
+    let path = zeitwerk_path(constant);
+    if path.is_empty() {
+        return;
+    }
+
+    let file_id = ctx.result.symbols[0].id;
+
+    // Track names for call confidence scoring.
+    ctx.imported_names.insert(constant.to_string());
+    let short = constant.split("::").last().unwrap_or(constant);
+    ctx.imported_names.insert(short.to_string());
+
+    ctx.result.raw_imports.push(RawImport {
+        source_id: file_id,
+        module_raw: path.clone(),
+        is_relative: false,
+        dot_count: 0,
+        module_path: path.clone(),
+    });
+
+    let target_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, path.as_bytes());
+    ctx.result.relationships.push(Relationship {
+        source_id: file_id,
+        target_id,
+        rel_type: RelationType::Imports,
+        confidence: 0.6, // inferred from Zeitwerk convention, not explicit require
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Definition collection
 // ---------------------------------------------------------------------------
@@ -421,6 +480,10 @@ fn process_class(
                 rel_type: RelationType::Inherits,
                 confidence,
             });
+
+            // Zeitwerk autoload: generate a synthetic import for the superclass
+            // so the walker can resolve file-to-file Import edges.
+            emit_zeitwerk_import(&base_name, ctx);
         }
     }
 
@@ -497,6 +560,9 @@ fn collect_mixin_includes(
                 rel_type: RelationType::Inherits,
                 confidence,
             });
+
+            // Zeitwerk autoload: generate a synthetic import for the included module.
+            emit_zeitwerk_import(&module_name, ctx);
         }
     }
 }
@@ -935,6 +1001,73 @@ end
             inherits[0].target_id, expected_id,
             "Inherits target UUID should be new_v5(NAMESPACE_OID, 'Interrupt')"
         );
+    }
+
+    #[test]
+    fn test_camel_to_snake() {
+        assert_eq!(camel_to_snake("ApplicationController"), "application_controller");
+        assert_eq!(camel_to_snake("Api"), "api");
+        assert_eq!(camel_to_snake("V1"), "v1");
+        assert_eq!(camel_to_snake("User"), "user");
+        assert_eq!(camel_to_snake("VoiceScreen"), "voice_screen");
+    }
+
+    #[test]
+    fn test_zeitwerk_path() {
+        assert_eq!(zeitwerk_path("ApplicationController"), "application_controller");
+        assert_eq!(zeitwerk_path("Api::V1::CandidatesController"), "api/v1/candidates_controller");
+        assert_eq!(zeitwerk_path("Authenticatable"), "authenticatable");
+    }
+
+    #[test]
+    fn test_superclass_generates_zeitwerk_import() {
+        let source = r#"
+class CandidatesController < ApplicationController
+  def index
+  end
+end
+"#;
+        let result =
+            parse_ruby_file("app/controllers/candidates_controller.rb", source, "test", chrono::Utc::now());
+
+        // Should have a RawImport for the Zeitwerk path of ApplicationController.
+        let import = result
+            .raw_imports
+            .iter()
+            .find(|i| i.module_path == "application_controller");
+        assert!(import.is_some(), "Expected Zeitwerk import for ApplicationController");
+
+        // Should have an Imports relationship.
+        let imports: Vec<_> = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::Imports)
+            .collect();
+        assert!(!imports.is_empty(), "Expected at least one Imports relationship from Zeitwerk inference");
+    }
+
+    #[test]
+    fn test_include_generates_zeitwerk_import() {
+        let source = r#"
+class User < ApplicationRecord
+  include Authenticatable
+  include Api::Trackable
+end
+"#;
+        let result =
+            parse_ruby_file("app/models/user.rb", source, "test", chrono::Utc::now());
+
+        let auth_import = result
+            .raw_imports
+            .iter()
+            .find(|i| i.module_path == "authenticatable");
+        assert!(auth_import.is_some(), "Expected Zeitwerk import for Authenticatable");
+
+        let trackable_import = result
+            .raw_imports
+            .iter()
+            .find(|i| i.module_path == "api/trackable");
+        assert!(trackable_import.is_some(), "Expected Zeitwerk import for Api::Trackable");
     }
 
     #[test]
