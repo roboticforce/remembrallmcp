@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remembrallmcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Persistent knowledge memory and code dependency graph for AI agents - Rust, Postgres, pgvector, MCP"
 readme = "README.md"
 license = "MIT"
