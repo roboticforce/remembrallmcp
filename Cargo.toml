@@ -11,7 +11,7 @@ description = "Persistent knowledge memory layer for AI agents - Rust, Postgres,
 keywords = ["mcp", "ai", "memory", "knowledge-graph", "pgvector"]
 categories = ["development-tools", "database"]
 homepage = "https://roboticforce.io/remembrall"
-repository = "https://github.com/cdnsteve/remembrallmcp"
+repository = "https://github.com/roboticforce/remembrallmcp"
 
 [workspace.dependencies]
 tokio = { version = "=1.50.0", features = ["full"] }

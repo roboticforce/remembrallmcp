@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remembrallmcp"
+version = "0.3.0"
+description = "Persistent knowledge memory and code dependency graph for AI agents - Rust, Postgres, pgvector, MCP"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "RobotICForce", email = "contact@roboticforce.io" },
+]
+keywords = ["mcp", "ai-agents", "memory", "knowledge-graph", "code-intelligence", "pgvector", "ai-memory", "llm-tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://roboticforce.io/remembrall"
+Documentation = "https://roboticforce.io/remembrall"
+Repository = "https://github.com/roboticforce/remembrallmcp"
+"Bug Tracker" = "https://github.com/roboticforce/remembrallmcp/issues"
+"AI Agency" = "https://roboticforce.io"

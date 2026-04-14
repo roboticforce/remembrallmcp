@@ -1,7 +1,7 @@
 {
   "name": "remembrallmcp",
   "version": "0.3.0",
-  "mcpName": "io.github.cdnsteve/remembrallmcp",
+  "mcpName": "io.github.roboticforce/remembrallmcp",
   "description": "Persistent knowledge memory layer for AI agents. Rust core, Postgres + pgvector backend, MCP protocol.",
   "main": "index.js",
   "directories": {
@@ -13,14 +13,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cdnsteve/remembrallmcp.git"
+    "url": "git+https://github.com/roboticforce/remembrallmcp.git"
   },
   "keywords": ["mcp", "ai-agents", "memory", "knowledge-graph", "code-intelligence", "pgvector"],
-  "author": "Steven Leggett <contact@roboticforce.io>",
+  "author": "RobotICForce <contact@roboticforce.io> (https://roboticforce.io)",
   "license": "MIT",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/cdnsteve/remembrallmcp/issues"
+    "url": "https://github.com/roboticforce/remembrallmcp/issues"
   },
   "homepage": "https://roboticforce.io/remembrall",
   "dependencies": {
