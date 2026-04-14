@@ -12,7 +12,7 @@ name = "remembrall"
 path = "src/main.rs"
 
 [dependencies]
-remembrall-core = { version = "=0.1.0", path = "../remembrall-core" }
+remembrall-core = { version = "=0.3.0", path = "../remembrall-core" }
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 sqlx = { workspace = true }
