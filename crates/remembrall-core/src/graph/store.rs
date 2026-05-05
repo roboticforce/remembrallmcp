@@ -372,7 +372,13 @@ impl GraphStore {
         Ok(rows.into_iter().map(|r| r.into_impact_result()).collect())
     }
 
-    /// Find a symbol by name, optionally filtered by type and/or project.
+    /// Find a symbol by name or file basename, optionally filtered by type and/or project.
+    ///
+    /// Matching is case-insensitive and covers:
+    /// - Exact name match (e.g. `UsersController`)
+    /// - File basename without extension (e.g. `users_controller` matches `users_controller.rb`)
+    ///
+    /// Exact name matches are returned first. Results are capped at 50.
     pub async fn find_symbol(
         &self,
         name: &str,
@@ -398,8 +404,16 @@ impl GraphStore {
             SELECT id, name, symbol_type, file_path, start_line, end_line,
                    language, project, signature, file_mtime, layer
             FROM {schema}.symbols
-            WHERE name = $1
+            WHERE (
+                name ILIKE $1
+                OR regexp_replace(file_path, '^.*/', '') ILIKE ($1 || '.%')
+                OR regexp_replace(file_path, '^.*/', '') ILIKE $1
+            )
             {clauses}
+            ORDER BY
+                CASE WHEN lower(name) = lower($1) THEN 0 ELSE 1 END,
+                name
+            LIMIT 50
             "#,
             schema = self.schema,
         );

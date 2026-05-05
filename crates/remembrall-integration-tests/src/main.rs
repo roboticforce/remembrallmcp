@@ -342,6 +342,29 @@ async fn test_graph_find_symbol(graph: &GraphStore) -> Result<()> {
     Ok(())
 }
 
+async fn test_graph_find_symbol_by_file_stem(graph: &GraphStore) -> Result<()> {
+    // Rails-style: class name is CamelCase, file is snake_case
+    let cls = make_symbol("UsersController", "app/controllers/users_controller.rb", SymbolType::Class, "rails_proj");
+    graph.upsert_symbol(&cls).await?;
+
+    // Searching by the file stem should return the class defined in that file
+    let found = graph.find_symbol("users_controller", None, None).await?;
+    anyhow::ensure!(!found.is_empty(), "find_symbol by file stem returned nothing");
+    anyhow::ensure!(
+        found.iter().any(|s| s.name == "UsersController"),
+        "find_symbol by file stem did not return UsersController"
+    );
+
+    // Searching by the class name directly should also still work (case-insensitive)
+    let found2 = graph.find_symbol("userscontroller", None, None).await?;
+    anyhow::ensure!(
+        found2.iter().any(|s| s.name == "UsersController"),
+        "case-insensitive name search failed"
+    );
+
+    Ok(())
+}
+
 async fn test_graph_remove_file(graph: &GraphStore) -> Result<()> {
     let sym = make_symbol("ephemeral_fn", "src/ephemeral.rs", SymbolType::Function, "test_proj");
     graph.upsert_symbol(&sym).await?;
@@ -788,6 +811,7 @@ async fn main() -> Result<()> {
 
     runner.record("graph_add_relationship", test_graph_add_relationship(&graph).await.map(|_| ()));
     runner.record("graph_find_symbol", test_graph_find_symbol(&graph).await);
+    runner.record("graph_find_symbol_by_file_stem", test_graph_find_symbol_by_file_stem(&graph).await);
     runner.record("graph_remove_file", test_graph_remove_file(&graph).await);
 
     // --- Impact analysis ---

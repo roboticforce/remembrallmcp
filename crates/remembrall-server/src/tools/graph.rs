@@ -49,7 +49,7 @@ pub struct ImpactParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LookupParams {
-    #[schemars(description = "Symbol name to look up")]
+    #[schemars(description = "Symbol name or file stem to look up. Case-insensitive. Matches class/function names (e.g. 'UsersController') and file basenames without extension (e.g. 'users_controller' matches symbols in 'users_controller.rb').")]
     pub name: String,
     #[schemars(description = "Filter: function, class, method, file")]
     pub symbol_type: Option<String>,
