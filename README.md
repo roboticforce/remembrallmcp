@@ -1,5 +1,7 @@
 # RemembrallMCP
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg) [![Crates.io](https://img.shields.io/crates/v/remembrall-server.svg)](https://crates.io/crates/remembrall-server) [![CI](https://github.com/cdnsteve/remembrallmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/cdnsteve/remembrallmcp/actions/workflows/ci.yml) [![Docker](https://img.shields.io/docker/pulls/cdnsteve/remembrallmcp.svg)](https://hub.docker.com/r/cdnsteve/remembrallmcp)
+
 Persistent knowledge memory and code intelligence for AI agents. Rust core, Postgres + pgvector, MCP protocol.
 
 **The problem:** AI coding agents are stateless. Every session starts from zero - no memory of past decisions, no understanding of how the codebase fits together, no way to know what breaks when you change something.

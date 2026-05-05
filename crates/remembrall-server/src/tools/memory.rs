@@ -40,6 +40,10 @@ pub struct StoreParams {
     pub importance: Option<f32>,
     #[schemars(description = "Where this came from (PR URL, file path, etc.)")]
     pub source_identifier: Option<String>,
+    #[schemars(description = "Tenant/organization scope for multi-tenant isolation. When set, only that tenant can retrieve this memory.")]
+    pub organization: Option<String>,
+    #[schemars(description = "Optional sub-project scope within the organization.")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -54,6 +58,8 @@ pub struct RecallParams {
     pub tags: Option<String>,
     #[schemars(description = "Filter to memories about a specific project")]
     pub project: Option<String>,
+    #[schemars(description = "Tenant/organization scope. When set, only memories stored under this organization are returned.")]
+    pub organization: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -85,7 +91,7 @@ pub async fn store_impl(
     embedder: &Arc<dyn Embedder>,
     params: StoreParams,
 ) -> Result<CallToolResult, McpError> {
-    let StoreParams { content, memory_type, summary, tags, importance, source_identifier } = params;
+    let StoreParams { content, memory_type, summary, tags, importance, source_identifier, organization, project } = params;
 
     let mtype: MemoryType = memory_type.parse().map_err(|e: String| {
         McpError::invalid_params(format!("invalid memory_type: {e}"), None)
@@ -128,9 +134,9 @@ pub async fn store_impl(
             author: None,
         },
         scope: Scope {
-            organization: None,
+            organization,
             team: None,
-            project: None,
+            project,
         },
         tags: tags.unwrap_or_default(),
         metadata: None,
@@ -161,7 +167,7 @@ pub async fn recall_impl(
     embedder: &Arc<dyn Embedder>,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
-    let RecallParams { query, limit, memory_types, tags, project } = params;
+    let RecallParams { query, limit, memory_types, tags, project, organization } = params;
 
     if query.trim().is_empty() {
         let text = json!({
@@ -189,11 +195,11 @@ pub async fn recall_impl(
         s.split(',').map(|t| t.trim().to_string()).collect()
     });
 
-    let scope = project.map(|p| Scope {
-        organization: None,
-        team: None,
-        project: Some(p),
-    });
+    let scope = if organization.is_some() || project.is_some() {
+        Some(Scope { organization, team: None, project })
+    } else {
+        None
+    };
 
     let embedder = Arc::clone(embedder);
     let query_clone = query.clone();

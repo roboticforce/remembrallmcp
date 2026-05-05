@@ -10,3 +10,6 @@ dist/
 credentials*.json
 secrets*.json
 benchmarks/results/
+scripts/screenshots/
+node_modules/
+*.egg-info/

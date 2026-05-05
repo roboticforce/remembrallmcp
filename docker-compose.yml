@@ -1,6 +1,7 @@
 services:
   db:
     image: pgvector/pgvector:0.8.2-pg16
+    restart: unless-stopped
     volumes:
       - db_data:/var/lib/postgresql/data
     ports:
