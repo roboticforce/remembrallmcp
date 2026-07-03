@@ -86,7 +86,7 @@ impl RemembrallServer {
         tools::memory::delete_impl(&self.memory, params).await
     }
 
-    #[tool(description = "Index a project directory to build the code graph. Must be run before impact analysis or symbol lookup. Supports Python, TypeScript, JavaScript, Rust, Go, Ruby, Java, and Kotlin.")]
+    #[tool(description = "Index a project directory to build the code graph. Must be run before impact analysis or symbol lookup. Captures functions, classes, methods, and data fields plus their call, import, defines, inherits, and field-reference relationships. Supports Python, TypeScript, JavaScript, Rust, Go, Ruby, Java, and Kotlin.")]
     async fn remembrall_index(
         &self,
         Parameters(params): Parameters<IndexParams>,
@@ -94,7 +94,7 @@ impl RemembrallServer {
         tools::graph::index_impl(&self.graph, &self.watched_dirs, params).await
     }
 
-    #[tool(description = "Analyze the blast radius of changing a code symbol. Returns all callers (upstream) or all callees (downstream) up to max_depth levels. Use this before refactoring to understand what will break.")]
+    #[tool(description = "Analyze the blast radius of changing a code symbol. Returns all callers (upstream) or all callees (downstream) up to max_depth levels. Works on functions, classes, methods, and fields - ask 'who references the amount field?' and get the methods that read it. Use this before refactoring to understand what will break.")]
     async fn remembrall_impact(
         &self,
         Parameters(params): Parameters<ImpactParams>,
@@ -102,7 +102,7 @@ impl RemembrallServer {
         tools::graph::impact_impl(&self.graph, params).await
     }
 
-    #[tool(description = "Look up a code symbol by name. Returns its file location, type, and line numbers. Use this to find where a function or class is defined.")]
+    #[tool(description = "Look up a code symbol by name. Returns its file location, type, and line numbers. Works for functions, classes, methods, and fields. Use this to find where a symbol is defined.")]
     async fn remembrall_lookup_symbol(
         &self,
         Parameters(params): Parameters<LookupParams>,
@@ -144,17 +144,17 @@ impl ServerHandler for RemembrallServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "RemembrallMCP is a persistent knowledge memory layer for AI agents. \
+                "RemembrallMCP gives an AI coding agent whole-codebase knowledge: a field-aware code graph plus persistent memory. \
+                 Use remembrall_index to build the code graph from a project directory (functions, classes, methods, and fields across 8 languages). \
+                 Use remembrall_impact to analyze what code would break if you change a symbol - works on functions, classes, methods, and fields, so you can ask who references a given struct or model field. \
+                 Use remembrall_lookup_symbol to find where a function, class, method, or field is defined. \
+                 Use remembrall_tour to get a guided reading-order tour of an indexed project - start here when onboarding to an unfamiliar codebase. \
                  Use remembrall_recall to search for past decisions, patterns, errors, and knowledge before starting work. \
                  Use remembrall_store to save decisions, patterns, and context. \
                  Use remembrall_update to edit an existing memory (content, summary, tags, or importance) without deleting and re-creating it. \
                  Use remembrall_delete to remove stale memories. \
                  Use remembrall_ingest_github to bulk-import merged PR descriptions from a GitHub repo - run this once per project to solve the cold-start problem. \
-                 Use remembrall_ingest_docs to scan a project directory for markdown files and ingest them as memories - run this once per project to immediately populate RemembrallMCP from README, ARCHITECTURE, ADRs, and docs. \
-                 Use remembrall_index to build a code graph from a project directory. \
-                 Use remembrall_tour to get a guided reading-order tour of an indexed project - start here when onboarding to an unfamiliar codebase. \
-                 Use remembrall_impact to analyze what code would break if you change a symbol. \
-                 Use remembrall_lookup_symbol to find where a function or class is defined."
+                 Use remembrall_ingest_docs to scan a project directory for markdown files and ingest them as memories - run this once per project to immediately populate RemembrallMCP from README, ARCHITECTURE, ADRs, and docs."
                     .to_string(),
             )
     }

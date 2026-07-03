@@ -1,0 +1,129 @@
+# Ground truth for field-level reference tracking (Phase 1).
+#
+# Three small fixtures (Python, Rust, Go) each with a class/struct, a data
+# field, and a self/receiver read of that field. Verifies the parser captures
+# Field symbols, Defines (type -> field) and References (method -> field)
+# edges, and that upstream impact analysis on a field returns the method that
+# reads it.
+#
+# Run:
+#   cargo run -p remembrall-test-harness --bin remembrall-test -- \
+#       test-fixtures/field-capture test-fixtures/field-capture.toml
+
+[meta]
+language = "multi"
+project = "field-capture"
+version = "1"
+root = "."
+
+# ---------------------------------------------------------------------------
+# Symbols that must exist
+# ---------------------------------------------------------------------------
+
+[[symbols]]
+file = "src/invoice.py"
+name = "Invoice"
+kind = "Class"
+
+[[symbols]]
+file = "src/invoice.py"
+name = "total"
+kind = "Method"
+
+[[symbols]]
+file = "src/invoice.py"
+name = "amount"
+kind = "Field"
+
+[[symbols]]
+file = "src/invoice.py"
+name = "currency"
+kind = "Field"
+
+[[symbols]]
+file = "src/account.rs"
+name = "Account"
+kind = "Class"
+
+[[symbols]]
+file = "src/account.rs"
+name = "Account::double"
+kind = "Method"
+
+[[symbols]]
+file = "src/account.rs"
+name = "balance"
+kind = "Field"
+
+[[symbols]]
+file = "src/server.go"
+name = "Server"
+kind = "Class"
+
+[[symbols]]
+file = "src/server.go"
+name = "Label"
+kind = "Method"
+
+[[symbols]]
+file = "src/server.go"
+name = "Address"
+kind = "Field"
+
+# ---------------------------------------------------------------------------
+# Relationships that must exist
+# ---------------------------------------------------------------------------
+
+# Defines: class/struct -> field
+[[relationships]]
+kind = "Defines"
+source = "src/invoice.py::Invoice"
+target = "src/invoice.py::amount"
+tier = "must_find"
+
+[[relationships]]
+kind = "Defines"
+source = "src/invoice.py::Invoice"
+target = "src/invoice.py::currency"
+tier = "must_find"
+
+[[relationships]]
+kind = "Defines"
+source = "src/account.rs::Account"
+target = "src/account.rs::balance"
+tier = "must_find"
+
+[[relationships]]
+kind = "Defines"
+source = "src/server.go::Server"
+target = "src/server.go::Address"
+tier = "must_find"
+
+# References: method -> field (self / receiver read)
+[[relationships]]
+kind = "References"
+source = "src/invoice.py::total"
+target = "src/invoice.py::amount"
+tier = "must_find"
+
+[[relationships]]
+kind = "References"
+source = "src/account.rs::Account::double"
+target = "src/account.rs::balance"
+tier = "must_find"
+
+[[relationships]]
+kind = "References"
+source = "src/server.go::Label"
+target = "src/server.go::Address"
+tier = "must_find"
+
+# ---------------------------------------------------------------------------
+# Impact: upstream of a field returns the method that reads it
+# ---------------------------------------------------------------------------
+
+[[impact_queries]]
+target = "src/invoice.py::amount"
+direction = "upstream"
+hops = 1
+expected = ["src/invoice.py::total"]

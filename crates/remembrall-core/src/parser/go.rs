@@ -57,6 +57,7 @@ pub fn parse_go_file(
         result: FileParseResult::default(),
         name_to_id: HashMap::new(),
         imported_names: HashSet::new(),
+        struct_fields: HashMap::new(),
     };
 
     // File-level symbol - always the first symbol in the result.
@@ -73,6 +74,8 @@ pub fn parse_go_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // Pass 1: collect imports.
@@ -107,6 +110,10 @@ struct ParseContext<'a> {
     name_to_id: HashMap<String, Uuid>,
     /// Import aliases and package names imported into this file.
     imported_names: HashSet<String>,
+    /// (struct_id, field_name) -> field symbol UUID for struct fields defined in
+    /// this file. Used to resolve receiver field reads (`s.X`) inside methods to
+    /// the struct's field.
+    struct_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +287,8 @@ fn process_function_declaration(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -334,6 +343,8 @@ fn process_method_declaration(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // DEFINES from the receiver struct (if we know it), otherwise from the file.
@@ -415,6 +426,8 @@ fn process_type_spec(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -427,6 +440,70 @@ fn process_type_spec(
     // Collect embedded types (struct embedding / interface embedding).
     if let Some(type_body) = type_node {
         collect_embeddings(&type_body, id, source, ctx);
+        // Capture named struct fields as Field symbols (skips embedded fields,
+        // which have no `name` and are already emitted as Inherits above).
+        if type_kind == "struct_type" {
+            collect_struct_fields(&type_body, id, source, ctx);
+        }
+    }
+}
+
+/// Walk a `struct_type` body and emit a `Field` symbol + `Defines` edge for each
+/// named `field_declaration`. Embedded fields (no `name`) are skipped - they are
+/// handled as `Inherits` by `collect_embeddings`.
+fn collect_struct_fields(
+    type_body: &Node<'_>,
+    struct_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    // struct_type's named child is `field_declaration_list`; descend into it.
+    let mut cursor = type_body.walk();
+    let list = type_body
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "field_declaration_list");
+    let Some(list) = list else {
+        return;
+    };
+    let mut lc = list.walk();
+    for child in list.named_children(&mut lc) {
+        if child.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue; // embedded field, no name
+        };
+        let name = node_text(&name_node, source);
+        if name.is_empty() {
+            continue;
+        }
+        let start_line = child.start_position().row as i32 + 1;
+        let end_line = child.end_position().row as i32 + 1;
+        let field_id = Uuid::new_v4();
+        ctx.struct_fields.insert((struct_id, name.clone()), field_id);
+
+        ctx.result.symbols.push(Symbol {
+            id: field_id,
+            name,
+            symbol_type: SymbolType::Field,
+            file_path: ctx.file_path.to_string(),
+            start_line: Some(start_line),
+            end_line: Some(end_line),
+            language: "go".to_string(),
+            project: ctx.project.to_string(),
+            signature: None,
+            file_mtime: ctx.file_mtime,
+            layer: None,
+            parent_symbol_id: Some(struct_id),
+            moniker: None,
+        });
+
+        ctx.result.relationships.push(Relationship {
+            source_id: struct_id,
+            target_id: field_id,
+            rel_type: RelationType::Defines,
+            confidence: 1.0,
+        });
     }
 }
 
@@ -506,6 +583,13 @@ fn collect_calls<'a>(
     for child in node.children(cursor) {
         if child.kind() == "call_expression" {
             process_call(&child, source, ctx);
+        }
+        // Receiver field reads: `s.X` where `s` is the method receiver - emit a
+        // References edge to the struct's field. Method calls (`s.M()`) and
+        // qualified package access (`pkg.X`) are filtered inside
+        // process_receiver_field_read.
+        if child.kind() == "selector_expression" {
+            process_receiver_field_read(&child, source, ctx);
         }
         let mut inner = child.walk();
         collect_calls(&child, source, ctx, &mut inner);
@@ -599,6 +683,91 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Opti
     }
 
     best.map(|(id, _)| id)
+}
+
+/// Walk up the AST from `node` to find the enclosing method's receiver and
+/// return `(receiver_var_name, receiver_type_name)`. Returns None outside a
+/// method (free functions have no receiver).
+fn find_enclosing_receiver(node: &Node<'_>, source: &[u8]) -> Option<(String, String)> {
+    let mut current = node.parent()?;
+    loop {
+        if current.kind() == "method_declaration" {
+            if let Some(recv) = current.child_by_field_name("receiver") {
+                let type_name = extract_receiver_type(&recv, source).unwrap_or_default();
+                let mut cursor = recv.walk();
+                for param in recv.named_children(&mut cursor) {
+                    if param.kind() == "parameter_declaration" {
+                        if let Some(name_node) = param.child_by_field_name("name") {
+                            let var_name = node_text(&name_node, source);
+                            if !var_name.is_empty() && !type_name.is_empty() {
+                                return Some((var_name, type_name));
+                            }
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Emit a `References` edge for a receiver field read `s.X` inside a method.
+///
+/// Only direct `<receiver>.<field>` selector expressions where the object is the
+/// receiver variable. Intermediate reads in `s.a.b()` (i.e. `s.a`) are still
+/// caught. Method calls (`s.M()`) and writes (`s.X = ...`) are skipped. The
+/// field is resolved against the receiver struct via the per-file `struct_fields`
+/// map.
+fn process_receiver_field_read(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let Some(obj) = node.child_by_field_name("operand") else {
+        return;
+    };
+    if obj.kind() != "identifier" {
+        return;
+    }
+    let obj_name = node_text(&obj, source);
+
+    let Some(field_node) = node.child_by_field_name("field") else {
+        return;
+    };
+    let field_name = node_text(&field_node, source);
+    if field_name.is_empty() {
+        return;
+    }
+
+    let Some((recv_var, type_name)) = find_enclosing_receiver(node, source) else {
+        return;
+    };
+    if obj_name != recv_var {
+        return;
+    }
+
+    if let Some(parent) = node.parent() {
+        // Skip method invocations: `s.Method()`.
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(&struct_id) = ctx.name_to_id.get(&type_name) else {
+        return;
+    };
+    let Some(&field_id) = ctx.struct_fields.get(&(struct_id, field_name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_function(node, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -851,4 +1020,132 @@ fn node_text(node: &Node<'_>, source: &[u8]) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn parse(source: &str) -> FileParseResult {
+        parse_go_file("test.go", source, "proj", Utc::now())
+    }
+
+    fn field_symbols(result: &FileParseResult) -> Vec<&Symbol> {
+        result
+            .symbols
+            .iter()
+            .filter(|s| s.symbol_type == SymbolType::Field)
+            .collect()
+    }
+
+    fn references_rels(result: &FileParseResult) -> Vec<&Relationship> {
+        result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::References)
+            .collect()
+    }
+
+    #[test]
+    fn test_struct_fields_captured() {
+        // Named struct fields become Field symbols; embedded fields do not.
+        let source = r#"
+package main
+
+type Server struct {
+    Logger
+    addr string
+    port int
+}
+"#;
+        let result = parse(source);
+        let fields = field_symbols(&result);
+        let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["addr", "port"], "fields: {fields:?}");
+        let struct_id = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Class && s.name == "Server")
+            .map(|s| s.id)
+            .unwrap();
+        for f in &fields {
+            assert_eq!(f.parent_symbol_id, Some(struct_id));
+            assert!(
+                result.relationships.iter().any(|r| {
+                    r.rel_type == RelationType::Defines
+                        && r.source_id == struct_id
+                        && r.target_id == f.id
+                }),
+                "missing Defines(struct -> field {})",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_receiver_field_read_emits_references() {
+        // `s.addr` read inside a method emits a References edge to the field.
+        let source = r#"
+package main
+
+type Server struct {
+    addr string
+}
+
+func (s *Server) Address() string {
+    return s.addr
+}
+"#;
+        let result = parse(source);
+        let addr = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Field && s.name == "addr")
+            .map(|s| s.id)
+            .expect("addr field should exist");
+        let address = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Method && s.name == "Address")
+            .map(|s| s.id)
+            .expect("Address method should exist");
+        let refs = references_rels(&result);
+        assert!(
+            refs.iter()
+                .any(|r| r.source_id == address && r.target_id == addr),
+            "expected References(Server.Address -> addr), refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_receiver_method_call_not_a_field_reference() {
+        // `s.Start()` is a method call, not a field read.
+        let source = r#"
+package main
+
+type Server struct {
+    addr string
+}
+
+func (s *Server) Start() string {
+    return s.addr
+}
+
+func (s *Server) Run() string {
+    return s.Start()
+}
+"#;
+        let result = parse(source);
+        let refs = references_rels(&result);
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly 1 References edge (s.addr), got: {refs:?}"
+        );
+    }
 }

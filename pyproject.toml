@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "remembrallmcp"
 version = "0.3.1"
-description = "Persistent knowledge memory and code dependency graph for AI agents - Rust, Postgres, pgvector, MCP"
+description = "Whole-codebase knowledge for AI coding agents - a field-aware code graph (functions, classes, methods, fields, and references across 8 languages) plus persistent memory. Rust, Postgres, pgvector, MCP"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "RobotICForce", email = "contact@roboticforce.io" },
 ]
-keywords = ["mcp", "ai-agents", "memory", "knowledge-graph", "code-intelligence", "pgvector", "ai-memory", "llm-tools"]
+keywords = ["mcp", "ai-agents", "memory", "knowledge-graph", "code-intelligence", "code-graph", "field-references", "impact-analysis", "pgvector", "ai-memory", "llm-tools"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

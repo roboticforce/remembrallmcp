@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// A code symbol (function, class, method, file).
+/// A code symbol (function, class, method, field, file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: Uuid,
@@ -16,6 +16,15 @@ pub struct Symbol {
     pub signature: Option<String>,
     pub file_mtime: DateTime<Utc>,
     pub layer: Option<String>,
+    /// For field/property symbols, the enclosing class/struct symbol. None for
+    /// file/function/class/method symbols. Parent linkage is also expressible via a
+    /// `Defines` relationship (parent -> child); this column makes "member of" queryable
+    /// without an edge join and disambiguates same-named fields across classes.
+    pub parent_symbol_id: Option<Uuid>,
+    /// Stable, position-independent, scheme-qualified identifier (SCIP-style descriptor,
+    /// e.g. `pkg mod Class#field.`). Populated in Phase 3 as the cross-pass join key for
+    /// the DSL string-literal resolver and the dedup key across reindex. None in Phase 1.
+    pub moniker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +33,10 @@ pub enum SymbolType {
     Function,
     Class,
     Method,
+    /// A data field/attribute/property of a class or struct (e.g. Python class attribute,
+    /// Rust struct field, Go struct field, TS class field). Scoped under a parent class via
+    /// `Symbol::parent_symbol_id`. Distinct from `Method` (callable members).
+    Field,
 }
 
 impl std::fmt::Display for SymbolType {
@@ -33,6 +46,7 @@ impl std::fmt::Display for SymbolType {
             Self::Function => write!(f, "function"),
             Self::Class => write!(f, "class"),
             Self::Method => write!(f, "method"),
+            Self::Field => write!(f, "field"),
         }
     }
 }
@@ -45,6 +59,7 @@ impl std::str::FromStr for SymbolType {
             "function" => Ok(Self::Function),
             "class" => Ok(Self::Class),
             "method" => Ok(Self::Method),
+            "field" => Ok(Self::Field),
             _ => Err(format!("Unknown symbol type: {s}")),
         }
     }
@@ -66,6 +81,11 @@ pub enum RelationType {
     Defines,
     Inherits,
     UsesType,
+    /// A source symbol references (reads) a target field/property. The source is the
+    /// enclosing function/method (or file/class when at class-body scope); the target is a
+    /// `SymbolType::Field`. Distinct from `Calls` (invoking a callable) and `UsesType`
+    /// (referencing a type). Flows into impact analysis like any relationship.
+    References,
 }
 
 impl std::fmt::Display for RelationType {
@@ -76,6 +96,7 @@ impl std::fmt::Display for RelationType {
             Self::Defines => write!(f, "defines"),
             Self::Inherits => write!(f, "inherits"),
             Self::UsesType => write!(f, "uses_type"),
+            Self::References => write!(f, "references"),
         }
     }
 }
@@ -89,6 +110,7 @@ impl std::str::FromStr for RelationType {
             "defines" => Ok(Self::Defines),
             "inherits" => Ok(Self::Inherits),
             "uses_type" => Ok(Self::UsesType),
+            "references" => Ok(Self::References),
             _ => Err(format!("Unknown relation type: {s}")),
         }
     }

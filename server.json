@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cdnsteve/remembrallmcp",
+  "title": "RemembrallMCP",
+  "description": "Whole-codebase knowledge for AI coding agents. A field-aware code graph (functions, classes, methods, fields, and references across 8 languages) plus persistent memory, built on Rust, Postgres + pgvector, exposed over MCP.",
+  "repository": {
+    "url": "https://github.com/cdnsteve/remembrallmcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "remembrallmcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "PostgreSQL connection string with pgvector extension",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true,
+          "name": "DATABASE_URL"
+        }
+      ]
+    }
+  ]
+}

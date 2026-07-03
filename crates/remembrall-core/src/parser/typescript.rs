@@ -79,6 +79,7 @@ pub fn parse_ts_file(
         result: FileParseResult::default(),
         name_to_id: HashMap::new(),
         imported_names: HashSet::new(),
+        class_fields: HashMap::new(),
     };
 
     // File-level symbol.
@@ -95,6 +96,8 @@ pub fn parse_ts_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // First pass: collect imports.
@@ -124,6 +127,10 @@ struct TsParseContext<'a> {
     result: FileParseResult,
     name_to_id: HashMap<String, Uuid>,
     imported_names: HashSet<String>,
+    /// (class_id, field_name) -> field symbol UUID for class data fields defined
+    /// in this file. Used to resolve `this.<field>` reads to the enclosing class's
+    /// field.
+    class_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,11 +310,19 @@ fn collect_definitions<'a>(
                 // Class field with arrow function value:
                 //   fetch: (req: Request) => Response = (req) => { ... }
                 // The `value` field (from _initializer) holds the arrow_function.
-                if let Some(value) = child.child_by_field_name("value") {
-                    if matches!(
-                        value.kind(),
-                        "arrow_function" | "function_expression" | "generator_function_expression"
-                    ) {
+                let is_function_field = child
+                    .child_by_field_name("value")
+                    .map(|v| {
+                        matches!(
+                            v.kind(),
+                            "arrow_function"
+                                | "function_expression"
+                                | "generator_function_expression"
+                        )
+                    })
+                    .unwrap_or(false);
+                if is_function_field {
+                    if let Some(value) = child.child_by_field_name("value") {
                         let name = child
                             .child_by_field_name("name")
                             .map(|n| node_text(&n, source))
@@ -336,6 +351,8 @@ fn collect_definitions<'a>(
                             signature: Some(signature),
                             file_mtime: ctx.file_mtime,
                             layer: None,
+                            parent_symbol_id: None,
+                            moniker: None,
                         });
                         ctx.result.relationships.push(Relationship {
                             source_id: parent_id,
@@ -352,6 +369,10 @@ fn collect_definitions<'a>(
                             collect_definitions(&body, sym_id, None, source, ctx, &mut inner);
                         }
                     }
+                } else {
+                    // Non-function class field: `amount = 0;`, `amount: number;`,
+                    // `#amount = 0;`. Capture as a Field symbol scoped under the class.
+                    process_class_field(&child, enclosing_class, source, ctx);
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
@@ -475,6 +496,8 @@ fn process_function_declaration(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -526,6 +549,8 @@ fn process_method_definition(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -569,6 +594,8 @@ fn process_class_declaration(
         signature: Some(format!("class {name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -736,6 +763,8 @@ fn process_interface_declaration(
         signature: Some(format!("interface {name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -777,6 +806,8 @@ fn process_type_alias_declaration(
         signature: Some(format!("type {name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -838,6 +869,8 @@ fn process_arrow_function_or_fn_expr(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -870,6 +903,12 @@ fn collect_calls<'a>(
     for child in node.children(cursor) {
         if child.kind() == "call_expression" {
             process_call(&child, source, ctx);
+        }
+        // `this.<field>` reads - emit a References edge to the enclosing class's
+        // field. Method calls (`this.method()`) and writes (`this.x = ...`) are
+        // filtered out inside process_field_read.
+        if child.kind() == "member_expression" {
+            process_field_read(&child, source, ctx);
         }
         let mut inner = child.walk();
         collect_calls(&child, source, ctx, &mut inner);
@@ -995,6 +1034,131 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &TsParseContext<'_>) -> Op
     }
 
     best.map(|(id, _)| id)
+}
+
+/// Find the UUID of the innermost class symbol that contains `node`.
+fn find_enclosing_class(node: &Node<'_>, ctx: &TsParseContext<'_>) -> Option<Uuid> {
+    let target = node.start_position().row as i32 + 1;
+    let mut best: Option<(Uuid, i32)> = None; // (id, span)
+
+    for sym in &ctx.result.symbols {
+        if sym.symbol_type != SymbolType::Class {
+            continue;
+        }
+        let (start, end) = match (sym.start_line, sym.end_line) {
+            (Some(s), Some(e)) => (s, e),
+            _ => continue,
+        };
+        if target >= start && target <= end {
+            let range = end - start;
+            if range < best.map(|(_, r)| r).unwrap_or(i32::MAX) {
+                best = Some((sym.id, range));
+            }
+        }
+    }
+
+    best.map(|(id, _)| id)
+}
+
+/// Capture a non-function class field as a `Field` symbol with a `Defines` edge
+/// from the enclosing class. Handles `amount = 0;`, `amount: number;`, and
+/// private fields `#amount = 0;`.
+fn process_class_field(
+    node: &Node<'_>,
+    enclosing_class: Option<Uuid>,
+    source: &[u8],
+    ctx: &mut TsParseContext<'_>,
+) -> Option<Uuid> {
+    let class_id = enclosing_class?;
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(&name_node, source);
+    if name.is_empty() {
+        return None;
+    }
+
+    let start_line = node.start_position().row as i32 + 1;
+    let end_line = node.end_position().row as i32 + 1;
+    let id = Uuid::new_v4();
+    ctx.class_fields.insert((class_id, name.clone()), id);
+
+    ctx.result.symbols.push(Symbol {
+        id,
+        name,
+        symbol_type: SymbolType::Field,
+        file_path: ctx.file_path.to_string(),
+        start_line: Some(start_line),
+        end_line: Some(end_line),
+        language: ctx.lang_tag.to_string(),
+        project: ctx.project.to_string(),
+        signature: None,
+        file_mtime: ctx.file_mtime,
+        layer: None,
+        parent_symbol_id: Some(class_id),
+        moniker: None,
+    });
+
+    ctx.result.relationships.push(Relationship {
+        source_id: class_id,
+        target_id: id,
+        rel_type: RelationType::Defines,
+        confidence: 1.0,
+    });
+
+    Some(id)
+}
+
+/// Emit a `References` edge for a `this.<field>` read inside a method.
+///
+/// Only direct `this.<name>` member expressions (object is `this`). Intermediate
+/// reads in `this.service.method()` (i.e. `this.service`) are still caught.
+/// Method calls (`this.method()`) and writes (`this.x = ...`) are skipped. Only
+/// resolves when the property names a known class field of the enclosing class.
+fn process_field_read(node: &Node<'_>, source: &[u8], ctx: &mut TsParseContext<'_>) {
+    let Some(obj) = node.child_by_field_name("object") else {
+        return;
+    };
+    if obj.kind() != "this" {
+        return;
+    }
+    let Some(prop) = node.child_by_field_name("property") else {
+        return;
+    };
+    let field_name = node_text(&prop, source);
+    if field_name.is_empty() {
+        return;
+    }
+
+    if let Some(parent) = node.parent() {
+        // Skip method invocations: `this.method()`.
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id())
+        {
+            return;
+        }
+        // Skip writes: `this.x = ...`.
+        if parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("left").map(|l| l.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(class_id) = find_enclosing_class(node, ctx) else {
+        return;
+    };
+    let Some(&field_id) = ctx.class_fields.get(&(class_id, field_name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_function(node, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
 }
 
 fn resolve_name(name: &str, ctx: &TsParseContext<'_>) -> (Uuid, f32) {
@@ -1399,5 +1563,120 @@ function handle(req: ExternalRequest): ExternalResponse {}
             );
         }
         assert_eq!(rels.len(), 2, "Expected 2 UsesType rels, got {}", rels.len());
+    }
+
+    #[test]
+    fn test_class_fields_captured() {
+        // Non-function class fields become Field symbols scoped under the class.
+        let source = r#"
+class Invoice {
+    amount: number = 0;
+    currency: string;
+}
+"#;
+        let result = parse(source);
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.symbol_type == SymbolType::Field)
+            .collect();
+        let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["amount", "currency"], "fields: {fields:?}");
+        let class_id = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Class && s.name == "Invoice")
+            .map(|s| s.id)
+            .unwrap();
+        for f in &fields {
+            assert_eq!(f.parent_symbol_id, Some(class_id));
+            assert!(
+                result.relationships.iter().any(|r| {
+                    r.rel_type == RelationType::Defines
+                        && r.source_id == class_id
+                        && r.target_id == f.id
+                }),
+                "missing Defines(class -> field {})",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_arrow_field_stays_method() {
+        // A class field holding an arrow function stays a Method, not a Field.
+        let source = r#"
+class Controller {
+    handler: (req: Request) => void = (req) => {};
+}
+"#;
+        let result = parse(source);
+        let fields: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.symbol_type == SymbolType::Field)
+            .collect();
+        assert!(fields.is_empty(), "arrow field should be a Method, not Field");
+    }
+
+    #[test]
+    fn test_this_field_read_emits_references() {
+        // `this.amount` read inside a method emits a References edge to the field.
+        let source = r#"
+class Invoice {
+    amount: number = 0;
+    total(): number {
+        return this.amount;
+    }
+}
+"#;
+        let result = parse(source);
+        let amount = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Field && s.name == "amount")
+            .map(|s| s.id)
+            .expect("amount field should exist");
+        let total = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "total")
+            .map(|s| s.id)
+            .expect("total method should exist");
+        assert!(
+            result.relationships.iter().any(|r| {
+                r.rel_type == RelationType::References
+                    && r.source_id == total
+                    && r.target_id == amount
+            }),
+            "expected References(total -> amount)"
+        );
+    }
+
+    #[test]
+    fn test_this_method_call_not_a_field_reference() {
+        // `this.compute()` is a method call, not a field read.
+        let source = r#"
+class Calc {
+    factor: number = 1;
+    compute(): number {
+        return this.factor;
+    }
+    run(): number {
+        return this.compute();
+    }
+}
+"#;
+        let result = parse(source);
+        let refs: Vec<_> = result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::References)
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly 1 References edge (this.factor), got: {refs:?}"
+        );
     }
 }

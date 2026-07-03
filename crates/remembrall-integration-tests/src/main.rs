@@ -106,6 +106,8 @@ fn make_symbol(name: &str, file_path: &str, symbol_type: SymbolType, project: &s
         signature: None,
         file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     }
 }
 
@@ -378,6 +380,80 @@ async fn test_graph_remove_file(graph: &GraphStore) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Field-level reference tracking (Phase 1)
+// ---------------------------------------------------------------------------
+
+/// End-to-end field capture: parse a Python snippet with a class + data field +
+/// a `self.x` read inside a method, upsert the parser output into the graph, then
+/// assert `find_symbol` returns the field and `impact_analysis` upstream on the
+/// field returns the method that reads it.
+async fn test_field_capture_python(graph: &GraphStore) -> Result<()> {
+    let source = r#"
+class Invoice:
+    amount = 0
+
+    def __init__(self, amount):
+        self.amount = amount
+
+    def total(self):
+        return self.amount
+"#;
+    let result = parse_python_file(
+        "src/invoice.py",
+        source,
+        "field_proj",
+        Utc::now(),
+    );
+
+    // The parser must emit a Field symbol named "amount" parented to the class.
+    let field = result
+        .symbols
+        .iter()
+        .find(|s| s.symbol_type == SymbolType::Field && s.name == "amount")
+        .ok_or_else(|| {
+            let names: Vec<String> = result
+                .symbols
+                .iter()
+                .map(|s| format!("{:?}:{}", s.symbol_type, s.name))
+                .collect();
+            anyhow::anyhow!("no Field symbol 'amount' emitted; got: {names:?}")
+        })?;
+    anyhow::ensure!(
+        field.parent_symbol_id.is_some(),
+        "field 'amount' should have a parent_symbol_id pointing at the class"
+    );
+
+    // Upsert every symbol the parser produced.
+    for sym in &result.symbols {
+        graph.upsert_symbol(sym).await?;
+    }
+    // Persist every relationship (Defines class->field, References method->field, ...).
+    for rel in &result.relationships {
+        graph.add_relationship(rel).await?;
+    }
+
+    // find_symbol must surface the field by name.
+    let found = graph.find_symbol("amount", None, Some("field_proj")).await?;
+    anyhow::ensure!(
+        found.iter().any(|s| s.symbol_type == SymbolType::Field && s.name == "amount"),
+        "find_symbol('amount') did not return the field"
+    );
+
+    // Locate the field's stored id (use the parser-emitted id; upsert is id-stable).
+    let field_id = field.id;
+
+    // Upstream blast radius of the field = who references it? Must include `total`.
+    let results = graph.impact_analysis(field_id, Direction::Upstream, 10).await?;
+    let names: Vec<&str> = results.iter().map(|r| r.symbol.name.as_str()).collect();
+    anyhow::ensure!(
+        names.contains(&"total"),
+        "upstream of field 'amount' should include method 'total', got: {names:?}"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Impact analysis tests
 // ---------------------------------------------------------------------------
 
@@ -519,6 +595,8 @@ async fn test_tour_order(graph: &GraphStore) -> Result<()> {
         signature: None,
         file_mtime: now,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
 
     let lib_sym = Symbol {
@@ -533,6 +611,8 @@ async fn test_tour_order(graph: &GraphStore) -> Result<()> {
         signature: None,
         file_mtime: now,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
 
     let utils_sym = Symbol {
@@ -547,6 +627,8 @@ async fn test_tour_order(graph: &GraphStore) -> Result<()> {
         signature: None,
         file_mtime: now,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
 
     graph.upsert_symbol(&main_sym).await?;
@@ -813,6 +895,9 @@ async fn main() -> Result<()> {
     runner.record("graph_find_symbol", test_graph_find_symbol(&graph).await);
     runner.record("graph_find_symbol_by_file_stem", test_graph_find_symbol_by_file_stem(&graph).await);
     runner.record("graph_remove_file", test_graph_remove_file(&graph).await);
+
+    // --- Field-level reference tracking ---
+    runner.record("field_capture_python", test_field_capture_python(&graph).await);
 
     // --- Impact analysis ---
     match setup_impact_chain(&graph).await {

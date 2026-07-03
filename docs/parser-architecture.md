@@ -2,7 +2,7 @@
 
 ## Overview
 
-RemembrallMCP's parser system converts source code from any supported language into a universal code graph. The graph has only 4 symbol types and 4 relationship types - regardless of whether the source is Python, Rust, Go, or anything else.
+RemembrallMCP's parser system converts source code from any supported language into a universal code graph. The graph has 5 symbol types and 5 relationship types - regardless of whether the source is Python, Rust, Go, or anything else.
 
 ## The Pipeline
 
@@ -81,8 +81,8 @@ Every parser returns the same `FileParseResult`:
 
 ```rust
 pub struct FileParseResult {
-    pub symbols: Vec<Symbol>,         // Functions, classes, methods, files
-    pub relationships: Vec<Relationship>, // Calls, imports, defines, inherits
+    pub symbols: Vec<Symbol>,         // Functions, classes, methods, fields, files
+    pub relationships: Vec<Relationship>, // Calls, imports, defines, inherits, references
     pub raw_imports: Vec<RawImport>,  // Unresolved import metadata for phase 2
 }
 ```
@@ -90,11 +90,11 @@ pub struct FileParseResult {
 The universal types:
 
 ```
-Symbols:  File | Function | Class | Method
-Edges:    Calls | Imports | Defines | Inherits
+Symbols:  File | Function | Class | Method | Field
+Edges:    Calls | Imports | Defines | Inherits | References
 ```
 
-This is deliberately minimal. We don't model constants, variables, type aliases, or other fine-grained constructs. 4+4 covers the relationships that matter for impact analysis.
+This is deliberately minimal. We don't model constants, variables, type aliases, or other fine-grained constructs. 5+5 covers the relationships that matter for impact analysis.
 
 ## Two-Phase Resolution (walker.rs)
 
@@ -107,9 +107,10 @@ Cross-file relationships can't be resolved within a single file parse. The walke
 
 **Phase 2: Resolve across files**
 - Build a map of all File symbols: `path_stem -> UUID`
-- Build a map of all named symbols: `name -> UUID`
+- Build a map of all named symbols: `name -> UUID` (includes `Field` symbols)
 - Rewrite placeholder import UUIDs to real file symbol UUIDs
 - Rewrite placeholder call UUIDs to real function/method symbol UUIDs
+- Rewrite placeholder `References` UUIDs to real field symbol UUIDs when the field name is unambiguous (single candidate); drop ambiguous `References` edges (no fan-out)
 - Unresolvable references (stdlib, third-party) keep their placeholders and are skipped at DB insert
 
 This two-phase approach is what makes `from ..storage.work_queue import WorkQueue` resolve to the actual file, and what makes `self.queue.get_next_work()` match the real method.
@@ -124,8 +125,10 @@ To add language X:
 4. Add extension dispatch in `walker.rs`
 
 The parser needs to handle:
-- Symbol extraction (functions, classes/structs, methods)
+- Symbol extraction (functions, classes/structs, methods, fields)
 - Call detection (function calls, method calls)
+- Field capture (class/struct data fields as `Field` symbols with a `Defines` edge from the enclosing type)
+- Self/receiver field reads (`self.x`, `this.x`, `&self.x`, Go `s.X`) emitting a `References` edge from the enclosing method to the field, resolved in-parser to the enclosing class's field
 - Import detection (with raw import metadata for phase 2)
 - Inheritance detection (extends, implements, mixins, embedding)
 - Method-to-class association (Defines relationships)
@@ -147,6 +150,7 @@ Typical size: 200-400 lines per language. Most of the boilerplate is the same - 
 - Call expression parsing
 - Import statement parsing
 - Inheritance/trait detection
+- Field capture and self/receiver field-read resolution (language-specific receiver syntax: `self`, `this`, `&self`, Go receiver var)
 - Language-specific quirks (dotted calls, implicit interfaces, etc.)
 
 ## Why Tree-sitter (and Not LSP)
@@ -163,16 +167,19 @@ For a memory layer that needs to index any repo instantly without setup, tree-si
 
 **When to add LSP:** If fuzzy name matching produces too many false positives in practice and agents are making bad decisions based on noisy impact results.
 
-## Why 4 Symbol Types and 4 Relationship Types
+## Why 5 Symbol Types and 5 Relationship Types
 
-Current model: `File | Function | Class | Method` + `Calls | Imports | Defines | Inherits`
+Current model: `File | Function | Class | Method | Field` + `Calls | Imports | Defines | Inherits | References`
 
-This is deliberately minimal. Known gaps:
+This is deliberately minimal. The `Field` symbol type and `References` edge were added so `remembrall_impact` and `remembrall_lookup_symbol` work at the field level - answering "who references the `amount` field?" across all 7 languages. A `Field` symbol is parented to its enclosing class/struct via `parent_symbol_id`; the parser emits a `Defines` edge from the type to the field and a `References` edge from a method to the field for self/receiver field reads (`self.x`, `this.x`, `&self.x`, Go `s.X`), resolved in-parser to the enclosing type's field (exact, confidence 1.0, no fan-out). Cross-file `References` for unambiguous field names are resolved by the walker; ambiguous field names (multiple candidates) are dropped rather than fanned out one-edge-per-candidate, which would create thousands of false edges for common names like `name`.
+
+Known gaps (Phase 2/3, see `docs/field-level-references.md`):
+- **Non-self field access** - `obj.field` where `obj` is not `self`/`this`/the receiver (needs receiver-type resolution)
 - **Constants/config** - "What uses DATABASE_URL?" is not answerable
-- **Properties/fields** - "What reads user.email?" not tracked
-- **References (reads)** - distinct from Calls, not captured
+- **Read/write distinction** - `self.x = ...` writes are not yet distinguished from reads
+- **DSL string-literal references** - `Sum("amount")`, `.filter(x=)`, `#[serde(rename="x")]` (the differentiator no LSP server builds)
 
-These can be added incrementally without schema changes (just new enum values). We're waiting for real usage data to show which gaps actually matter before expanding.
+These can be added incrementally. The `moniker` column on `symbols` (SCIP-style stable identifiers) is already in the schema, populated in Phase 3.
 
 ## Performance
 

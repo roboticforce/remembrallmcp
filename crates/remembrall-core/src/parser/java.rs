@@ -61,6 +61,7 @@ pub fn parse_java_file(
         result: FileParseResult::default(),
         name_to_id: HashMap::new(),
         imported_names: HashSet::new(),
+        class_fields: HashMap::new(),
     };
 
     // Create the file-level symbol first.
@@ -77,6 +78,8 @@ pub fn parse_java_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // First pass: collect import declarations.
@@ -114,6 +117,10 @@ struct ParseContext<'a> {
     name_to_id: HashMap<String, Uuid>,
     /// Simple names imported into this file (the last component of the FQCN).
     imported_names: HashSet<String>,
+    /// (class_id, field_name) -> field symbol UUID for class fields defined in
+    /// this file. Used to resolve `this.<field>` reads to the enclosing class's
+    /// field.
+    class_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +236,13 @@ fn collect_definitions<'a>(
             if let Some(class_id) = enclosing_class {
                 process_method(&child, class_id, source, ctx);
             }
+        } else if kind == "field_declaration" {
+            // Class/interface body field: `int amount;` or `private int amount, total;`.
+            // Local variables in method bodies use `local_variable_declaration`, so
+            // these are genuine member fields.
+            if let Some(class_id) = enclosing_class {
+                process_field(&child, class_id, source, ctx);
+            }
         } else if kind == "block" || kind == "class_body" || kind == "interface_body" || kind == "enum_body" {
             // Descend into bodies to find nested type declarations and methods.
             let mut inner = child.walk();
@@ -273,6 +287,8 @@ fn process_type_decl(
         signature: Some(build_type_signature(node, &name, source)),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // DEFINES: parent scope (file or outer class) defines this type.
@@ -397,6 +413,8 @@ fn process_method(
         signature: Some(build_method_signature(node, &name, source)),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // DEFINES: class defines this method.
@@ -411,6 +429,57 @@ fn process_method(
     collect_type_annotations(node, id, source, ctx);
 
     id
+}
+
+/// Capture each variable declarator of a class-body `field_declaration` as a
+/// `Field` symbol with a `Defines` edge from the enclosing class. Handles
+/// multi-declarator fields (`int amount, total;`).
+fn process_field(
+    node: &Node<'_>,
+    class_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let name = node_text(&name_node, source);
+        if name.is_empty() {
+            continue;
+        }
+        let start_line = child.start_position().row as i32 + 1;
+        let end_line = child.end_position().row as i32 + 1;
+        let id = Uuid::new_v4();
+        ctx.class_fields.insert((class_id, name.clone()), id);
+
+        ctx.result.symbols.push(Symbol {
+            id,
+            name,
+            symbol_type: SymbolType::Field,
+            file_path: ctx.file_path.to_string(),
+            start_line: Some(start_line),
+            end_line: Some(end_line),
+            language: "java".to_string(),
+            project: ctx.project.to_string(),
+            signature: None,
+            file_mtime: ctx.file_mtime,
+            layer: None,
+            parent_symbol_id: Some(class_id),
+            moniker: None,
+        });
+
+        ctx.result.relationships.push(Relationship {
+            source_id: class_id,
+            target_id: id,
+            rel_type: RelationType::Defines,
+            confidence: 1.0,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +714,11 @@ fn collect_calls<'a>(
         if child.kind() == "method_invocation" {
             process_call(&child, source, ctx);
         }
+        // `this.<field>` reads - emit a References edge to the enclosing class's
+        // field. Writes (`this.x = ...`) are filtered inside process_field_read.
+        if child.kind() == "field_access" {
+            process_field_read(&child, source, ctx);
+        }
         let mut inner = child.walk();
         collect_calls(&child, source, ctx, &mut inner);
     }
@@ -745,6 +819,77 @@ fn find_enclosing_method(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Option
     }
 
     best.map(|(id, _, _)| id)
+}
+
+/// Find the UUID of the innermost class symbol that contains `node`.
+fn find_enclosing_class(node: &Node<'_>, ctx: &ParseContext<'_>) -> Option<Uuid> {
+    let target = node.start_position().row as i32 + 1;
+    let mut best: Option<(Uuid, i32)> = None; // (id, span)
+
+    for sym in &ctx.result.symbols {
+        if sym.symbol_type != SymbolType::Class || sym.file_path != ctx.file_path {
+            continue;
+        }
+        let (Some(s), Some(e)) = (sym.start_line, sym.end_line) else {
+            continue;
+        };
+        if target >= s && target <= e {
+            let range = e - s;
+            if range < best.map(|(_, r)| r).unwrap_or(i32::MAX) {
+                best = Some((sym.id, range));
+            }
+        }
+    }
+
+    best.map(|(id, _)| id)
+}
+
+/// Emit a `References` edge for a `this.<field>` read inside a method.
+///
+/// Only `field_access` nodes whose object is `this`. Method calls
+/// (`this.method()`) are separate `method_invocation` nodes, so they are not
+/// caught here. Writes (`this.x = ...`) are skipped. Only resolves when the
+/// field names a known class field of the enclosing class.
+fn process_field_read(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let Some(obj) = node.child_by_field_name("object") else {
+        return;
+    };
+    if node_text(&obj, source) != "this" {
+        return;
+    }
+    let Some(field_node) = node.child_by_field_name("field") else {
+        return;
+    };
+    let field_name = node_text(&field_node, source);
+    if field_name.is_empty() {
+        return;
+    }
+
+    // Skip writes: `this.x = ...`.
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("left").map(|l| l.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(class_id) = find_enclosing_class(node, ctx) else {
+        return;
+    };
+    let Some(&field_id) = ctx.class_fields.get(&(class_id, field_name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_method(node, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
 }
 
 // ---------------------------------------------------------------------------
