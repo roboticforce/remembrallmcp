@@ -139,6 +139,7 @@ fn parse_symbol_type(s: &str) -> Option<SymbolType> {
         "Function" => Some(SymbolType::Function),
         "Class" | "Struct" | "Enum" | "Trait" | "Interface" | "Module" | "Object" => Some(SymbolType::Class),
         "Method" => Some(SymbolType::Method),
+        "Field" | "Property" | "Attribute" => Some(SymbolType::Field),
         _ => None,
     }
 }
@@ -271,6 +272,7 @@ fn parse_rel_type(s: &str) -> Option<RelationType> {
         "Imports" => Some(RelationType::Imports),
         "Defines" => Some(RelationType::Defines),
         "Inherits" => Some(RelationType::Inherits),
+        "References" => Some(RelationType::References),
         _ => None,
     }
 }

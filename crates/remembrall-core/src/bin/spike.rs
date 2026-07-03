@@ -134,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
         file_path: "auth/session.py".into(), start_line: None, end_line: None,
         language: "python".into(), project: "myapp".into(), signature: None, file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
     let fn_validate = Symbol {
         id: Uuid::new_v4(), name: "validate_user".into(), symbol_type: SymbolType::Function,
@@ -141,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
         language: "python".into(), project: "myapp".into(),
         signature: Some("def validate_user(token: str) -> User".into()), file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
     let fn_login = Symbol {
         id: Uuid::new_v4(), name: "login".into(), symbol_type: SymbolType::Function,
@@ -148,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
         language: "python".into(), project: "myapp".into(),
         signature: Some("async def login(request: Request) -> Response".into()), file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
     let fn_middleware = Symbol {
         id: Uuid::new_v4(), name: "auth_middleware".into(), symbol_type: SymbolType::Function,
@@ -155,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
         language: "python".into(), project: "myapp".into(),
         signature: Some("async def auth_middleware(request, call_next)".into()), file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
     let fn_dashboard = Symbol {
         id: Uuid::new_v4(), name: "get_dashboard".into(), symbol_type: SymbolType::Function,
@@ -162,6 +170,8 @@ async fn main() -> anyhow::Result<()> {
         language: "python".into(), project: "myapp".into(),
         signature: Some("async def get_dashboard(user: User) -> DashboardData".into()), file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
     let fn_test = Symbol {
         id: Uuid::new_v4(), name: "test_validate_user".into(), symbol_type: SymbolType::Function,
@@ -169,6 +179,8 @@ async fn main() -> anyhow::Result<()> {
         language: "python".into(), project: "myapp".into(),
         signature: Some("def test_validate_user()".into()), file_mtime: Utc::now(),
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     };
 
     let t = Instant::now();

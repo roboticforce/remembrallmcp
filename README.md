@@ -2,15 +2,15 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg) [![Crates.io](https://img.shields.io/crates/v/remembrall-server.svg)](https://crates.io/crates/remembrall-server) [![CI](https://github.com/cdnsteve/remembrallmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/cdnsteve/remembrallmcp/actions/workflows/ci.yml) [![Docker](https://img.shields.io/docker/pulls/cdnsteve/remembrallmcp.svg)](https://hub.docker.com/r/cdnsteve/remembrallmcp)
 
-Persistent knowledge memory and code intelligence for AI agents. Rust core, Postgres + pgvector, MCP protocol.
+Whole-codebase knowledge for AI coding agents. A field-aware code graph plus persistent memory, built on Rust, Postgres + pgvector, and exposed over MCP.
 
-**The problem:** AI coding agents are stateless. Every session starts from zero - no memory of past decisions, no understanding of how the codebase fits together, no way to know what breaks when you change something.
+**The problem:** AI coding agents see a few pages out of the book each session. They grep, read, and re-derive how the codebase fits together from scratch - no map of what calls what, no way to know what breaks when something changes, and no memory of decisions made in past sessions.
 
-**The solution:** RemembrallMCP gives agents two things most memory tools don't:
+**The solution:** RemembrallMCP gives the agent the whole codebase - a field-aware dependency graph (functions, classes, methods, **fields**, and the references between them) across 8 languages, plus persistent memory that survives between sessions.
 
-**1. Persistent Memory** - Decisions, patterns, and organizational knowledge that survive between sessions. Hybrid semantic + full-text search finds relevant context instantly.
+**1. Field-Aware Code Graph** - A live map of your codebase built with tree-sitter. Functions, classes, methods, and data fields, plus call, import, defines, inherits, and field-reference relationships across 8 languages. Ask "what breaks if I change this?" - down to a single struct field - and get an answer in milliseconds, before the agent touches anything.
 
-**2. Code Dependency Graph** - A live map of your codebase built with tree-sitter. Functions, classes, imports, and call relationships across 8 languages. Ask "what breaks if I change this?" and get an answer in milliseconds - before the agent touches anything.
+**2. Persistent Memory** - Decisions, patterns, and organizational knowledge that survive between sessions. Hybrid semantic + full-text search finds relevant context instantly.
 
 ```
 remembrall_recall("authentication middleware patterns")
@@ -21,6 +21,9 @@ remembrall_index("/path/to/project", "myapp")
 
 remembrall_impact("AuthMiddleware", direction="upstream")
 -> 12 files depend on AuthMiddleware (with confidence scores)
+
+remembrall_impact("amount", direction="upstream")
+-> methods that read self.amount, across the whole codebase
 
 remembrall_store("Switched from JWT to session tokens because...")
 -> Decision stored for future sessions
@@ -36,12 +39,13 @@ With RemembrallMCP, that same query is a single `remembrall_impact` call that re
 |---|---|---|
 | "What calls UserService?" | Agent greps, reads 8-15 files, spawns sub-agents | `remembrall_impact` - 1 call, <1ms |
 | "Where is auth middleware defined?" | Agent globs, reads matches, filters | `remembrall_lookup_symbol` - 1 call, <1ms |
+| "Who references the `amount` field?" | Agent greps for `self.amount`, misses ORM and cross-module usages | `remembrall_impact` - 1 call, <1ms |
 | "What did we decide about caching?" | Agent has no context, asks you | `remembrall_recall` - 1 call, ~25ms |
 | Typical exploration cost | 5,000-20,000 tokens per question | ~200 tokens (tool call + response) |
 
 The savings scale with codebase size. On a small project, an agent can grep and read its way through. On a 500-file monorepo, that exploration becomes the bottleneck - agents hit context limits, spawn multiple sub-agents, or miss cross-module dependencies entirely. RemembrallMCP's graph queries stay under 10ms regardless of project size because the structure is pre-indexed in Postgres, not discovered at runtime.
 
-This is the difference between an agent that explores your codebase every time and one that already understands it.
+This is the difference between an agent that reads a few pages out of the book every time and one that already holds the whole codebase.
 
 ### Benchmarks
 
@@ -244,9 +248,9 @@ Restart your MCP client. All 9 tools will be available automatically.
 
 | Tool | Description |
 |------|-------------|
-| `remembrall_index` | Parse a project directory into a dependency graph (8 languages) |
-| `remembrall_impact` | Blast radius analysis - "what breaks if I change this?" |
-| `remembrall_lookup_symbol` | Find where a function or class is defined across the project |
+| `remembrall_index` | Parse a project directory into a field-aware code graph (functions, classes, methods, and fields across 8 languages) |
+| `remembrall_impact` | Blast radius analysis - "what breaks if I change this?" Works on functions, classes, methods, and fields |
+| `remembrall_lookup_symbol` | Find where a function, class, method, or field is defined across the project |
 
 ## Supported Languages
 
@@ -299,8 +303,9 @@ Tree-sitter Parsers           Ingestion Pipeline
 |              Postgres + pgvector                  |
 |                                                   |
 |  memories (text + embeddings + metadata)          |
-|  symbols (functions, classes, methods)            |
-|  relationships (calls, imports, inherits)         |
+|  symbols (functions, classes, methods, fields)    |
+|  relationships (calls, imports, defines,          |
+|                 inherits, references)             |
 +--------------------------------------------------+
                           |
                     MCP Server (stdio)

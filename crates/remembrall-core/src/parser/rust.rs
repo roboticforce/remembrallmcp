@@ -59,6 +59,7 @@ pub fn parse_rust_file(
         result: FileParseResult::default(),
         name_to_id: HashMap::new(),
         imported_names: HashSet::new(),
+        struct_fields: HashMap::new(),
     };
 
     // File-level symbol (always index 0 - other code depends on this).
@@ -75,6 +76,8 @@ pub fn parse_rust_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // Pass 1: collect `use` declarations (imports).
@@ -105,6 +108,11 @@ struct ParseContext<'a> {
     name_to_id: HashMap<String, Uuid>,
     /// Names brought into scope via `use` statements.
     imported_names: HashSet<String>,
+    /// (struct_id, field_name) -> field symbol UUID for struct fields defined in
+    /// this file. Used to resolve `self.<field>` reads inside `impl` blocks to the
+    /// struct's field. Keyed by struct id (not impl id) since methods live in a
+    /// separate `impl` block from the struct definition.
+    struct_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +403,8 @@ fn process_adt(
         signature: Some(format!("{keyword} {name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -407,9 +417,65 @@ fn process_adt(
     // USES_TYPE: struct field types.
     if keyword == "struct" {
         collect_type_annotations(node, id, source, ctx);
+        // Capture named struct fields as Field symbols with a Defines edge from
+        // the struct. Tuple-struct fields have no name and are skipped.
+        collect_struct_fields(node, id, source, ctx);
     }
 
     id
+}
+
+/// Walk a `struct_item` body and emit a `Field` symbol + `Defines` edge for each
+/// named `field_declaration`. Tuple-struct fields (no name) are skipped.
+fn collect_struct_fields(
+    node: &Node<'_>,
+    struct_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for field in body.named_children(&mut cursor) {
+        if field.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(name_node) = field.child_by_field_name("name") else {
+            continue; // tuple field, no name
+        };
+        let name = node_text(&name_node, source);
+        if name.is_empty() {
+            continue;
+        }
+        let start_line = field.start_position().row as i32 + 1;
+        let end_line = field.end_position().row as i32 + 1;
+        let field_id = Uuid::new_v4();
+        ctx.struct_fields.insert((struct_id, name.clone()), field_id);
+
+        ctx.result.symbols.push(Symbol {
+            id: field_id,
+            name,
+            symbol_type: SymbolType::Field,
+            file_path: ctx.file_path.to_string(),
+            start_line: Some(start_line),
+            end_line: Some(end_line),
+            language: "rust".to_string(),
+            project: ctx.project.to_string(),
+            signature: None,
+            file_mtime: ctx.file_mtime,
+            layer: None,
+            parent_symbol_id: Some(struct_id),
+            moniker: None,
+        });
+
+        ctx.result.relationships.push(Relationship {
+            source_id: struct_id,
+            target_id: field_id,
+            rel_type: RelationType::Defines,
+            confidence: 1.0,
+        });
+    }
 }
 
 /// Extract method signatures from a `trait_item` body.
@@ -507,6 +573,8 @@ fn process_impl(node: &Node<'_>, parent_id: Uuid, source: &[u8], ctx: &mut Parse
                         signature: Some(format!("trait {trait_name}")),
                         file_mtime: ctx.file_mtime,
                         layer: None,
+                        parent_symbol_id: None,
+                        moniker: None,
                     });
                     ctx.name_to_id.insert(trait_name.clone(), id);
                 }
@@ -620,6 +688,8 @@ fn process_function(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // DEFINES: parent scope (file or outer function) defines this function.
@@ -670,6 +740,12 @@ fn collect_calls_inner<'a>(
     for child in node.children(cursor) {
         if child.kind() == "call_expression" {
             process_call(&child, source, ctx, local_var_types);
+        }
+        // `self.<field>` reads - emit a References edge to the struct's field.
+        // Method calls (`self.method()`) and writes (`self.x = ...`) are filtered
+        // inside process_self_field_read.
+        if child.kind() == "field_expression" {
+            process_self_field_read(&child, source, ctx);
         }
         let mut inner = child.walk();
         collect_calls_inner(&child, source, ctx, &mut inner, local_var_types);
@@ -1024,6 +1100,90 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Opti
     }
 
     best.map(|(id, _)| id)
+}
+
+/// Walk up the AST from `node` to find the enclosing `impl_item` and return the
+/// name of the type being implemented. Returns None outside any impl block.
+fn find_enclosing_impl_type(node: &Node<'_>, source: &[u8]) -> Option<String> {
+    let mut current = node.parent()?;
+    loop {
+        if current.kind() == "impl_item" {
+            if let Some(type_node) = current.child_by_field_name("type") {
+                let name = extract_type_name(&type_node, source);
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Emit a `References` edge for a `self.<field>` read inside an `impl` method.
+///
+/// Only direct `self.<name>` field expressions (value is `self`). Intermediate
+/// reads in `self.foo.bar()` (i.e. `self.foo`) are still caught. Method calls
+/// (`self.method()`) and writes (`self.x = ...`) are skipped. The field is
+/// resolved against the struct named by the enclosing `impl` block via the
+/// per-file `struct_fields` map.
+fn process_self_field_read(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    // `self.x` -> value is `self` node or identifier "self". `&self.x` wraps the
+    // field_expression in a reference_expression; the field_expression's value is
+    // still `self`.
+    let is_self = match value.kind() {
+        "self" => true,
+        "identifier" => node_text(&value, source) == "self",
+        _ => false,
+    };
+    if !is_self {
+        return;
+    }
+    let Some(field_node) = node.child_by_field_name("field") else {
+        return;
+    };
+    let field_name = node_text(&field_node, source);
+    if field_name.is_empty() {
+        return;
+    }
+
+    if let Some(parent) = node.parent() {
+        // Skip method invocations: `self.method()`.
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id())
+        {
+            return;
+        }
+        // Skip writes: `self.x = ...`.
+        if parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("left").map(|l| l.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(type_name) = find_enclosing_impl_type(node, source) else {
+        return;
+    };
+    let Some(&struct_id) = ctx.name_to_id.get(&type_name) else {
+        return;
+    };
+    let Some(&field_id) = ctx.struct_fields.get(&(struct_id, field_name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_function(node, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1687,146 @@ fn process(a: Controller, b: Controller) {}
             rels.len(),
             1,
             "Duplicate UsesType for same type should be deduplicated, got: {rels:?}"
+        );
+    }
+
+    fn field_symbols(result: &FileParseResult) -> Vec<&Symbol> {
+        result
+            .symbols
+            .iter()
+            .filter(|s| s.symbol_type == SymbolType::Field)
+            .collect()
+    }
+
+    fn defines_rels(result: &FileParseResult) -> Vec<&Relationship> {
+        result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::Defines)
+            .collect()
+    }
+
+    fn references_rels(result: &FileParseResult) -> Vec<&Relationship> {
+        result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::References)
+            .collect()
+    }
+
+    #[test]
+    fn test_struct_fields_captured() {
+        // Named struct fields become Field symbols scoped under the struct.
+        let source = r#"
+struct Invoice {
+    amount: u32,
+    currency: String,
+}
+"#;
+        let result = parse(source);
+        let fields = field_symbols(&result);
+        let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["amount", "currency"], "fields: {fields:?}");
+        let struct_id = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Class && s.name == "Invoice")
+            .map(|s| s.id)
+            .unwrap();
+        for f in &fields {
+            assert_eq!(
+                f.parent_symbol_id,
+                Some(struct_id),
+                "field {} should be parented under the struct",
+                f.name
+            );
+        }
+        // Each field has a Defines edge from the struct.
+        let defines = defines_rels(&result);
+        for f in &fields {
+            assert!(
+                defines
+                    .iter()
+                    .any(|r| r.source_id == struct_id && r.target_id == f.id),
+                "missing Defines(struct -> field {})",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_tuple_struct_fields_skipped() {
+        // Tuple-struct fields have no name and must not be emitted as Field symbols.
+        let source = r#"
+struct Point(u32, u32);
+"#;
+        let result = parse(source);
+        let fields = field_symbols(&result);
+        assert!(fields.is_empty(), "tuple fields should be skipped: {fields:?}");
+    }
+
+    #[test]
+    fn test_self_field_read_emits_references() {
+        // `self.amount` read inside an impl method emits a References edge from
+        // the method to the struct's `amount` field.
+        let source = r#"
+struct Invoice {
+    amount: u32,
+}
+
+impl Invoice {
+    fn total(&self) -> u32 {
+        self.amount
+    }
+}
+"#;
+        let result = parse(source);
+        let amount = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Field && s.name == "amount")
+            .map(|s| s.id)
+            .expect("amount field should exist");
+        let total = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "Invoice::total")
+            .map(|s| s.id)
+            .expect("Invoice::total method should exist");
+        let refs = references_rels(&result);
+        assert!(
+            refs.iter()
+                .any(|r| r.source_id == total && r.target_id == amount),
+            "expected References(Invoice::total -> amount), refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_self_method_call_not_a_field_reference() {
+        // `self.compute()` is a method call, not a field read - it must not
+        // produce a References edge to a field.
+        let source = r#"
+struct Calc {
+    factor: u32,
+}
+
+impl Calc {
+    fn compute(&self) -> u32 {
+        self.factor
+    }
+    fn run(&self) -> u32 {
+        self.compute()
+    }
+}
+"#;
+        let result = parse(source);
+        let refs = references_rels(&result);
+        // Only `self.factor` in compute() should produce a References edge.
+        // `self.compute()` in run() is a Calls edge, not References.
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly 1 References edge (self.factor), got: {refs:?}"
         );
     }
 }

@@ -82,6 +82,7 @@ pub fn parse_python_file(
         name_to_id: HashMap::new(),
         // Modules imported into this file: module_name -> alias or original.
         imported_names: HashSet::new(),
+        class_fields: HashMap::new(),
     };
 
     // Create the file-level symbol first.
@@ -98,6 +99,8 @@ pub fn parse_python_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // First pass: collect imports so we can score call confidence later.
@@ -181,6 +184,12 @@ struct ParseContext<'a> {
     name_to_id: HashMap<String, Uuid>,
     /// Names that were imported (modules, names from modules).
     imported_names: HashSet<String>,
+    /// (class_id, field_name) -> field symbol UUID for class-body data attributes
+    /// defined in this file. Populated during definition collection; used during
+    /// call collection to resolve `self.<field>` reads to the enclosing class's
+    /// field. Class-body attributes only (e.g. Django model fields); attributes
+    /// assigned in `__init__` are not tracked in Phase 1.
+    class_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +433,14 @@ fn collect_definitions<'a>(
                     collect_definitions(&body, class_id, Some(class_id), source, ctx, &mut inner);
                 }
             }
+            // Class-body data attributes: `amount = ...` or `amount: int = ...`.
+            // Only treat as fields when directly inside a class body (enclosing_class
+            // is Some). Method-body `self.x = ...` writes are skipped (Phase 3).
+            "assignment" | "annotated_assignment" if enclosing_class.is_some() => {
+                if let Some(class_id) = enclosing_class {
+                    process_field(&child, class_id, source, ctx);
+                }
+            }
             "decorated_definition" => {
                 // @decorator\ndef foo(): ... or @decorator\nclass Foo: ...
                 // The actual definition is the last named child.
@@ -510,6 +527,8 @@ fn process_function(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // DEFINES: parent (file or class) defines this function/method.
@@ -554,6 +573,8 @@ fn process_class(
         signature: Some(format!("class {name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // DEFINES: file (or outer class) defines this class.
@@ -597,6 +618,63 @@ fn process_class(
     }
 
     id
+}
+
+/// Capture a class-body data attribute as a `Field` symbol and emit a `Defines`
+/// edge from the enclosing class.
+///
+/// Handles both `amount = ...` (assignment) and `amount: int = ...`
+/// (annotated_assignment). The field name is the left-hand identifier. Tuple
+/// unpacking and non-identifier left sides are skipped. Field names are NOT
+/// inserted into `name_to_id` (they are not callable and would collide with
+/// same-named methods); they live in `class_fields` for `self.<field>` resolution.
+fn process_field(
+    node: &Node<'_>,
+    enclosing_class_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) -> Option<Uuid> {
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&left, source);
+    if name.is_empty() {
+        return None;
+    }
+
+    let start_line = node.start_position().row as i32 + 1;
+    let end_line = node.end_position().row as i32 + 1;
+    let id = Uuid::new_v4();
+
+    ctx.class_fields
+        .insert((enclosing_class_id, name.clone()), id);
+
+    ctx.result.symbols.push(Symbol {
+        id,
+        name: name.clone(),
+        symbol_type: SymbolType::Field,
+        file_path: ctx.file_path.to_string(),
+        start_line: Some(start_line),
+        end_line: Some(end_line),
+        language: "python".to_string(),
+        project: ctx.project.to_string(),
+        signature: None,
+        file_mtime: ctx.file_mtime,
+        layer: None,
+        parent_symbol_id: Some(enclosing_class_id),
+        moniker: None,
+    });
+
+    // DEFINES: class defines this field.
+    ctx.result.relationships.push(Relationship {
+        source_id: enclosing_class_id,
+        target_id: id,
+        rel_type: RelationType::Defines,
+        confidence: 1.0,
+    });
+
+    Some(id)
 }
 
 /// Build a human-readable signature string: `def foo(a, b, *, c=1) -> int`.
@@ -762,6 +840,12 @@ fn collect_calls<'a>(
             if let Some(type_node) = child.child_by_field_name("type") {
                 process_variable_annotation(&child, &type_node, source, ctx);
             }
+        }
+        // `self.<field>` reads - emit a References edge to the enclosing class's
+        // field. Method calls (`self.method()`) and writes (`self.x = ...`) are
+        // filtered out inside process_field_read.
+        if child.kind() == "attribute" {
+            process_field_read(&child, source, ctx);
         }
         let mut inner = child.walk();
         collect_calls(&child, source, ctx, &mut inner);
@@ -965,6 +1049,93 @@ fn find_enclosing_function(
     best.map(|(id, _, _)| id)
 }
 
+/// Find the UUID of the innermost class symbol that contains `node`.
+/// Returns None if the node is at module scope (not inside any class).
+fn find_enclosing_class(node: &Node<'_>, ctx: &ParseContext<'_>) -> Option<Uuid> {
+    let target = node.start_position().row as i32 + 1;
+    let mut best: Option<(Uuid, i32)> = None; // (id, span)
+
+    for sym in &ctx.result.symbols {
+        if sym.symbol_type != SymbolType::Class {
+            continue;
+        }
+        if sym.file_path != ctx.file_path {
+            continue;
+        }
+        let (Some(s), Some(e)) = (sym.start_line, sym.end_line) else {
+            continue;
+        };
+        if target >= s && target <= e {
+            let range = e - s;
+            if range < best.map(|(_, r)| r).unwrap_or(i32::MAX) {
+                best = Some((sym.id, range));
+            }
+        }
+    }
+
+    best.map(|(id, _)| id)
+}
+
+/// Emit a `References` edge for a `self.<field>` read inside a method.
+///
+/// Filters:
+/// - Only direct `self.<name>` attributes (object is the `self` identifier).
+///   Intermediate reads in `self.work_queue.get()` (i.e. `self.work_queue`) are
+///   still caught because that inner attribute has object `self`.
+/// - Skip method calls: `self.method()` - the attribute is the `function` child
+///   of a `call` node.
+/// - Skip writes: `self.x = ...` - the attribute is the `left` child of an
+///   assignment.
+/// - Only resolve when `<field>` is a known class-body field of the enclosing
+///   class (attributes assigned in `__init__` are not tracked in Phase 1).
+fn process_field_read(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let Some(obj) = node.child_by_field_name("object") else {
+        return;
+    };
+    if obj.kind() != "identifier" || node_text(&obj, source) != "self" {
+        return;
+    }
+    let Some(attr) = node.child_by_field_name("attribute") else {
+        return;
+    };
+    let field_name = node_text(&attr, source);
+    if field_name.is_empty() {
+        return;
+    }
+
+    // Skip method invocations: `self.method()`.
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "call"
+            && parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id())
+        {
+            return;
+        }
+        // Skip writes: `self.x = ...` and `self.x: T = ...`.
+        if (parent.kind() == "assignment" || parent.kind() == "annotated_assignment")
+            && parent.child_by_field_name("left").map(|l| l.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(class_id) = find_enclosing_class(node, ctx) else {
+        return;
+    };
+    let Some(&field_id) = ctx.class_fields.get(&(class_id, field_name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_function(node, source, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
@@ -974,4 +1145,165 @@ fn node_text(node: &Node<'_>, source: &[u8]) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn parse(source: &str) -> FileParseResult {
+        parse_python_file("test.py", source, "proj", Utc::now())
+    }
+
+    fn field_symbols(result: &FileParseResult) -> Vec<&Symbol> {
+        result
+            .symbols
+            .iter()
+            .filter(|s| s.symbol_type == SymbolType::Field)
+            .collect()
+    }
+
+    fn references_rels(result: &FileParseResult) -> Vec<&Relationship> {
+        result
+            .relationships
+            .iter()
+            .filter(|r| r.rel_type == RelationType::References)
+            .collect()
+    }
+
+    #[test]
+    fn test_class_body_fields_captured() {
+        // Class-body attribute assignments become Field symbols. This is the
+        // Django model field pattern: `amount = models.DecimalField(...)`.
+        let source = r#"
+class Invoice:
+    amount = 0
+    currency: str = "USD"
+    revenue_recognition_date = None
+"#;
+        let result = parse(source);
+        let fields = field_symbols(&result);
+        let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["amount", "currency", "revenue_recognition_date"],
+            "fields: {fields:?}"
+        );
+        let class_id = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Class && s.name == "Invoice")
+            .map(|s| s.id)
+            .unwrap();
+        for f in &fields {
+            assert_eq!(f.parent_symbol_id, Some(class_id));
+            assert!(
+                result.relationships.iter().any(|r| {
+                    r.rel_type == RelationType::Defines
+                        && r.source_id == class_id
+                        && r.target_id == f.id
+                }),
+                "missing Defines(class -> field {})",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_method_local_assignment_not_a_field() {
+        // Assignments inside a method body (`self.x = ...` or `local = ...`) are
+        // NOT class fields and must not produce Field symbols.
+        let source = r#"
+class Service:
+    timeout = 30
+
+    def run(self):
+        local = 5
+        self.cache = {}
+        return self.timeout
+"#;
+        let result = parse(source);
+        let fields = field_symbols(&result);
+        let names: Vec<_> = fields.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["timeout"], "only class-body fields: {fields:?}");
+    }
+
+    #[test]
+    fn test_self_field_read_emits_references() {
+        // `self.amount` read inside a method emits a References edge from the
+        // method to the class field.
+        let source = r#"
+class Invoice:
+    amount = 0
+
+    def total(self):
+        return self.amount
+"#;
+        let result = parse(source);
+        let amount = result
+            .symbols
+            .iter()
+            .find(|s| s.symbol_type == SymbolType::Field && s.name == "amount")
+            .map(|s| s.id)
+            .expect("amount field should exist");
+        let total = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "total")
+            .map(|s| s.id)
+            .expect("total method should exist");
+        let refs = references_rels(&result);
+        assert!(
+            refs.iter()
+                .any(|r| r.source_id == total && r.target_id == amount),
+            "expected References(total -> amount), refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_self_method_call_not_a_field_reference() {
+        // `self.compute()` is a method call (Calls), not a field read. Only
+        // `self.factor` should produce a References edge.
+        let source = r#"
+class Calc:
+    factor = 1
+
+    def compute(self):
+        return self.factor
+
+    def run(self):
+        return self.compute()
+"#;
+        let result = parse(source);
+        let refs = references_rels(&result);
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly 1 References edge (self.factor), got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_self_field_write_not_a_reference() {
+        // `self.amount = 5` is a write, not a read - it must not emit a
+        // References edge (Phase 3 handles writes).
+        let source = r#"
+class Invoice:
+    amount = 0
+
+    def set_amount(self, value):
+        self.amount = value
+"#;
+        let result = parse(source);
+        let refs = references_rels(&result);
+        assert!(
+            refs.is_empty(),
+            "self.amount write should not emit References, got: {refs:?}"
+        );
+    }
 }

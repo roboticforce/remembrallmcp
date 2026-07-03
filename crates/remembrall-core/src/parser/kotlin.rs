@@ -57,6 +57,7 @@ pub fn parse_kotlin_file(
         result: FileParseResult::default(),
         name_to_id: HashMap::new(),
         imported_names: HashSet::new(),
+        class_fields: HashMap::new(),
     };
 
     // File-level symbol - always the first entry in symbols.
@@ -73,6 +74,8 @@ pub fn parse_kotlin_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // Pass 1: collect imports from top-level `import` nodes.
@@ -103,6 +106,10 @@ struct ParseContext<'a> {
     name_to_id: HashMap<String, Uuid>,
     /// Short names imported into this file (for confidence scoring).
     imported_names: HashSet<String>,
+    /// (class_id, field_name) -> field symbol UUID for class properties defined
+    /// in this file. Used to resolve `this.<field>` reads to the enclosing
+    /// class's field.
+    class_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +222,10 @@ fn collect_definitions(
                     collect_definitions(&body, sym_id, false, source, ctx);
                 }
             }
+            // Class-body property: `val amount: Int = 0` or `var amount = 0`.
+            "property_declaration" if in_class_body => {
+                process_property(&child, parent_id, source, ctx);
+            }
             // Descend into other block constructs transparently.
             _ => {
                 collect_definitions(&child, parent_id, in_class_body, source, ctx);
@@ -258,6 +269,8 @@ fn process_type_declaration(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -271,6 +284,52 @@ fn process_type_declaration(
     collect_supertypes(node, id, source, ctx);
 
     id
+}
+
+/// Capture a class-body `property_declaration` (`val amount: Int = 0`) as a
+/// `Field` symbol with a `Defines` edge from the enclosing class. The property
+/// name is the `simple_identifier` inside the `variable_declaration` child.
+fn process_property(
+    node: &Node<'_>,
+    class_id: Uuid,
+    source: &[u8],
+    ctx: &mut ParseContext<'_>,
+) {
+    let name = find_child_by_kind(node, "variable_declaration")
+        .and_then(|vd| find_child_by_kind(&vd, "simple_identifier"))
+        .map(|n| node_text(&n, source))
+        .unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+
+    let start_line = node.start_position().row as i32 + 1;
+    let end_line = node.end_position().row as i32 + 1;
+    let id = Uuid::new_v4();
+    ctx.class_fields.insert((class_id, name.clone()), id);
+
+    ctx.result.symbols.push(Symbol {
+        id,
+        name,
+        symbol_type: SymbolType::Field,
+        file_path: ctx.file_path.to_string(),
+        start_line: Some(start_line),
+        end_line: Some(end_line),
+        language: "kotlin".to_string(),
+        project: ctx.project.to_string(),
+        signature: None,
+        file_mtime: ctx.file_mtime,
+        layer: None,
+        parent_symbol_id: Some(class_id),
+        moniker: None,
+    });
+
+    ctx.result.relationships.push(Relationship {
+        source_id: class_id,
+        target_id: id,
+        rel_type: RelationType::Defines,
+        confidence: 1.0,
+    });
 }
 
 /// Process a `companion_object` node.
@@ -302,6 +361,8 @@ fn process_companion_object(
         signature: Some(format!("companion object {name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -351,6 +412,8 @@ fn process_function(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -595,6 +658,12 @@ fn collect_calls(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
         if child.kind() == "call_expression" {
             process_call(&child, source, ctx);
         }
+        // `this.<field>` reads - emit a References edge to the enclosing class's
+        // field. Method calls (`this.method()`) are filtered inside
+        // process_this_field_read.
+        if child.kind() == "navigation_expression" {
+            process_this_field_read(&child, source, ctx);
+        }
         collect_calls(&child, source, ctx);
     }
 }
@@ -693,6 +762,87 @@ fn find_enclosing_function(call_node: &Node<'_>, ctx: &ParseContext<'_>) -> Opti
     }
 
     best.map(|(id, _, _)| id)
+}
+
+/// Find the UUID of the innermost class symbol that contains `node`.
+fn find_enclosing_class(node: &Node<'_>, ctx: &ParseContext<'_>) -> Option<Uuid> {
+    let target = node.start_position().row as i32 + 1;
+    let mut best: Option<(Uuid, i32)> = None; // (id, span)
+
+    for sym in &ctx.result.symbols {
+        if sym.symbol_type != SymbolType::Class || sym.file_path != ctx.file_path {
+            continue;
+        }
+        let (Some(s), Some(e)) = (sym.start_line, sym.end_line) else {
+            continue;
+        };
+        if target >= s && target <= e {
+            let range = e - s;
+            if range < best.map(|(_, r)| r).unwrap_or(i32::MAX) {
+                best = Some((sym.id, range));
+            }
+        }
+    }
+
+    best.map(|(id, _)| id)
+}
+
+/// Emit a `References` edge for a `this.<field>` read inside a method.
+///
+/// Only `navigation_expression` nodes whose receiver is `this`. Method calls
+/// (`this.method()`, where the navigation_expression is the callee of a
+/// `call_expression`) are skipped. Only resolves when the property names a
+/// known class field of the enclosing class.
+fn process_this_field_read(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+
+    // Receiver is the first named child.
+    let is_this = children
+        .iter()
+        .find(|c| c.is_named())
+        .map(|r| r.kind() == "this_expression" || node_text(r, source) == "this")
+        .unwrap_or(false);
+    if !is_this {
+        return;
+    }
+
+    let field_name = children
+        .iter()
+        .rev()
+        .find(|c| c.kind() == "identifier" || c.kind() == "simple_identifier")
+        .map(|n| node_text(n, source))
+        .unwrap_or_default();
+    if field_name.is_empty() {
+        return;
+    }
+
+    // Skip method invocations: `this.method()` - the navigation_expression is
+    // the first child (callee) of a call_expression.
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "call_expression"
+            && parent.child(0).map(|c| c.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(class_id) = find_enclosing_class(node, ctx) else {
+        return;
+    };
+    let Some(&field_id) = ctx.class_fields.get(&(class_id, field_name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_function(node, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
 }
 
 // ---------------------------------------------------------------------------

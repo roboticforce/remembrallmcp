@@ -173,7 +173,7 @@ pub fn index_directory(
         for s in &fr.symbols {
             if matches!(
                 s.symbol_type,
-                SymbolType::Function | SymbolType::Method | SymbolType::Class
+                SymbolType::Function | SymbolType::Method | SymbolType::Class | SymbolType::Field
             ) {
                 let key = Uuid::new_v5(&Uuid::NAMESPACE_OID, s.name.as_bytes());
                 synthetic_to_real.entry(key).or_default().push(s.id);
@@ -242,6 +242,29 @@ pub fn index_directory(
                         });
                     }
                 } else {
+                    result.relationships.push(rel);
+                }
+            } else if rel.rel_type == RelationType::References {
+                // No-fan-out ambiguity policy for field references.
+                //
+                // Unlike Calls (which fan out one edge per same-named candidate),
+                // field references must NOT fan out: a common field name like
+                // `name` across 50 classes would create thousands of false edges
+                // (perf + correctness). Resolve a synthetic target only when it
+                // maps to exactly one real field; if ambiguous, drop the edge
+                // rather than guess. In-parser-resolved References (real v4 field
+                // UUIDs, the Phase 1 common case) are not in synthetic_to_real
+                // and pass through unchanged.
+                if let Some(real_ids) = synthetic_to_real.get(&rel.target_id) {
+                    if real_ids.len() == 1 {
+                        let mut rel = rel;
+                        rel.target_id = real_ids[0];
+                        rel.confidence = (rel.confidence * 0.8).min(1.0);
+                        result.relationships.push(rel);
+                    }
+                    // ambiguous (len > 1): drop the edge (no fan-out)
+                } else {
+                    // Already resolved in-parser to a real field UUID - keep as-is.
                     result.relationships.push(rel);
                 }
             } else {
