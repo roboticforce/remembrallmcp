@@ -1,3 +1,8 @@
 # Ignore cloned test repos (large), keep ground truth TOML files
 */*
 !*/ground-truth.toml
+
+# Keep the committed field-capture fixture sources (small, not a cloned repo)
+!field-capture/
+!field-capture/src/
+!field-capture/src/**

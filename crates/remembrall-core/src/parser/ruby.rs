@@ -53,6 +53,7 @@ pub fn parse_ruby_file(
         result: FileParseResult::default(),
         name_to_id: HashMap::new(),
         imported_names: HashSet::new(),
+        class_fields: HashMap::new(),
     };
 
     // Create the file-level symbol first.
@@ -69,6 +70,8 @@ pub fn parse_ruby_file(
         signature: None,
         file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     // First pass: collect requires/require_relative so call scoring can use them.
@@ -107,6 +110,10 @@ struct ParseContext<'a> {
     name_to_id: HashMap<String, Uuid>,
     /// Module/class names that were required or included - used for confidence scoring.
     imported_names: HashSet<String>,
+    /// (class_id, attr_name) -> field symbol UUID for attributes declared via
+    /// `attr_accessor`/`attr_reader`/`attr_writer` in this file. Used to resolve
+    /// `@<attr>` instance variable reads to the enclosing class's field.
+    class_fields: HashMap<(Uuid, String), Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +443,8 @@ fn process_class(
         signature: Some(build_class_signature(node, &qualified_name, source)),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -613,6 +622,8 @@ fn process_module(
         signature: Some(format!("module {qualified_name}")),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -665,6 +676,8 @@ fn process_method(
         signature: Some(signature),
         file_mtime: ctx.file_mtime,
         layer: None,
+        parent_symbol_id: None,
+        moniker: None,
     });
 
     ctx.result.relationships.push(Relationship {
@@ -727,11 +740,41 @@ fn process_attr_call(
             signature: Some(format!("{method_name} :{name}")),
             file_mtime: ctx.file_mtime,
             layer: None,
+            parent_symbol_id: None,
+            moniker: None,
         });
 
         ctx.result.relationships.push(Relationship {
             source_id: parent_id,
             target_id: id,
+            rel_type: RelationType::Defines,
+            confidence: 1.0,
+        });
+
+        // Also emit a Field symbol for the underlying attribute so `@foo`
+        // instance variable reads can resolve to it for field-level impact
+        // analysis. The accessor Method symbol above stays as the callable.
+        let field_id = Uuid::new_v4();
+        ctx.class_fields
+            .insert((parent_id, name.clone()), field_id);
+        ctx.result.symbols.push(Symbol {
+            id: field_id,
+            name: name.clone(),
+            symbol_type: SymbolType::Field,
+            file_path: ctx.file_path.to_string(),
+            start_line: Some(line),
+            end_line: Some(line),
+            language: "ruby".to_string(),
+            project: ctx.project.to_string(),
+            signature: Some(format!("{method_name} :{name}")),
+            file_mtime: ctx.file_mtime,
+            layer: None,
+            parent_symbol_id: Some(parent_id),
+            moniker: None,
+        });
+        ctx.result.relationships.push(Relationship {
+            source_id: parent_id,
+            target_id: field_id,
             rel_type: RelationType::Defines,
             confidence: 1.0,
         });
@@ -771,6 +814,12 @@ fn collect_calls<'a>(
     for child in node.children(cursor) {
         if child.kind() == "call" {
             process_call(&child, source, ctx);
+        }
+        // `@foo` instance variable reads - emit a References edge to the
+        // enclosing class's field when the class declares `attr_* :foo`.
+        // Writes (`@foo = ...`) are filtered inside process_ivar_read.
+        if child.kind() == "instance_variable" {
+            process_ivar_read(&child, source, ctx);
         }
         let mut inner = child.walk();
         collect_calls(&child, source, ctx, &mut inner);
@@ -949,6 +998,70 @@ fn find_enclosing_function(
     }
 
     best.map(|(id, _)| id)
+}
+
+/// Find the UUID of the innermost class symbol that contains `node`.
+fn find_enclosing_class(node: &Node<'_>, ctx: &ParseContext<'_>) -> Option<Uuid> {
+    let target = node.start_position().row as i32 + 1;
+    let mut best: Option<(Uuid, i32)> = None; // (id, span)
+
+    for sym in &ctx.result.symbols {
+        if sym.symbol_type != SymbolType::Class || sym.file_path != ctx.file_path {
+            continue;
+        }
+        let (Some(s), Some(e)) = (sym.start_line, sym.end_line) else {
+            continue;
+        };
+        if target >= s && target <= e {
+            let range = e - s;
+            if range < best.map(|(_, r)| r).unwrap_or(i32::MAX) {
+                best = Some((sym.id, range));
+            }
+        }
+    }
+
+    best.map(|(id, _)| id)
+}
+
+/// Emit a `References` edge for an `@foo` instance variable read inside a method.
+///
+/// The `@` is stripped and the name is resolved against the enclosing class's
+/// `attr_accessor`/`attr_reader`/`attr_writer`-declared fields. Writes
+/// (`@foo = ...`) are skipped. Instance variables without a matching attr are
+/// not tracked in Phase 1 (Ruby has no class-body field declaration beyond attrs).
+fn process_ivar_read(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
+    let raw = node_text(node, source);
+    let name = raw.trim_start_matches('@').to_string();
+    if name.is_empty() {
+        return;
+    }
+
+    // Skip writes: `@foo = ...`. The instance_variable is the left side of an
+    // `assignment` node.
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "assignment"
+            && parent.child_by_field_name("left").map(|l| l.id()) == Some(node.id())
+        {
+            return;
+        }
+    }
+
+    let Some(class_id) = find_enclosing_class(node, ctx) else {
+        return;
+    };
+    let Some(&field_id) = ctx.class_fields.get(&(class_id, name.clone())) else {
+        return;
+    };
+
+    let source_id = find_enclosing_function(node, ctx)
+        .unwrap_or_else(|| ctx.result.symbols[0].id);
+
+    ctx.result.relationships.push(Relationship {
+        source_id,
+        target_id: field_id,
+        rel_type: RelationType::References,
+        confidence: 1.0,
+    });
 }
 
 // ---------------------------------------------------------------------------

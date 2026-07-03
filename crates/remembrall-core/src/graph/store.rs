@@ -47,6 +47,20 @@ impl GraphStore {
         .execute(&self.pool)
         .await?;
 
+        // Add field-tracking columns to existing installs (no migration framework;
+        // CREATE TABLE IF NOT EXISTS above does not add columns to an existing table, so
+        // these idempotent ALTERs self-migrate on every boot without data loss).
+        sqlx::query(&format!(
+            r#"
+            ALTER TABLE {schema}.symbols
+                ADD COLUMN IF NOT EXISTS parent_symbol_id UUID,
+                ADD COLUMN IF NOT EXISTS moniker TEXT
+            "#,
+            schema = self.schema,
+        ))
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS {schema}.relationships (
@@ -84,6 +98,15 @@ impl GraphStore {
 
         sqlx::query(&format!(
             r#"
+            CREATE INDEX IF NOT EXISTS idx_symbols_parent ON {schema}.symbols (parent_symbol_id);
+            "#,
+            schema = self.schema,
+        ))
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(&format!(
+            r#"
             CREATE INDEX IF NOT EXISTS idx_relationships_source ON {schema}.relationships (source_id);
             "#,
             schema = self.schema,
@@ -111,8 +134,8 @@ impl GraphStore {
         let (id,) = sqlx::query_as::<_, (Uuid,)>(&format!(
             r#"
             INSERT INTO {schema}.symbols
-                (id, name, symbol_type, file_path, start_line, end_line, language, project, signature, file_mtime, layer)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                (id, name, symbol_type, file_path, start_line, end_line, language, project, signature, file_mtime, layer, parent_symbol_id, moniker)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 symbol_type = EXCLUDED.symbol_type,
@@ -120,7 +143,9 @@ impl GraphStore {
                 end_line = EXCLUDED.end_line,
                 signature = EXCLUDED.signature,
                 file_mtime = EXCLUDED.file_mtime,
-                layer = EXCLUDED.layer
+                layer = EXCLUDED.layer,
+                parent_symbol_id = EXCLUDED.parent_symbol_id,
+                moniker = EXCLUDED.moniker
             RETURNING id
             "#,
             schema = self.schema,
@@ -136,6 +161,8 @@ impl GraphStore {
         .bind(&symbol.signature)
         .bind(symbol.file_mtime)
         .bind(&symbol.layer)
+        .bind(symbol.parent_symbol_id)
+        .bind(&symbol.moniker)
         .fetch_one(&self.pool)
         .await?;
 
@@ -152,19 +179,19 @@ impl GraphStore {
             // Build: INSERT INTO schema.symbols (col, ...) VALUES ($1,$2,...), ($N,...) ON CONFLICT ...
             let mut query_str = format!(
                 "INSERT INTO {schema}.symbols \
-                 (id, name, symbol_type, file_path, start_line, end_line, language, project, signature, file_mtime, layer) \
+                 (id, name, symbol_type, file_path, start_line, end_line, language, project, signature, file_mtime, layer, parent_symbol_id, moniker) \
                  VALUES ",
                 schema = self.schema,
             );
 
-            let cols_per_row: usize = 11;
+            let cols_per_row: usize = 13;
             for (i, _) in chunk.iter().enumerate() {
                 if i > 0 {
                     query_str.push_str(", ");
                 }
                 let base = i * cols_per_row + 1;
                 query_str.push_str(&format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                     base,
                     base + 1,
                     base + 2,
@@ -176,6 +203,8 @@ impl GraphStore {
                     base + 8,
                     base + 9,
                     base + 10,
+                    base + 11,
+                    base + 12,
                 ));
             }
 
@@ -187,7 +216,9 @@ impl GraphStore {
                  end_line = EXCLUDED.end_line, \
                  signature = EXCLUDED.signature, \
                  file_mtime = EXCLUDED.file_mtime, \
-                 layer = EXCLUDED.layer",
+                 layer = EXCLUDED.layer, \
+                 parent_symbol_id = EXCLUDED.parent_symbol_id, \
+                 moniker = EXCLUDED.moniker",
             );
 
             let mut query = sqlx::query(&query_str);
@@ -204,7 +235,9 @@ impl GraphStore {
                     .bind(&sym.project)
                     .bind(&sym.signature)
                     .bind(sym.file_mtime)
-                    .bind(&sym.layer);
+                    .bind(&sym.layer)
+                    .bind(sym.parent_symbol_id)
+                    .bind(&sym.moniker);
             }
             query.execute(&self.pool).await?;
         }
@@ -355,6 +388,7 @@ impl GraphStore {
             SELECT
                 s.id, s.name, s.symbol_type, s.file_path, s.start_line, s.end_line,
                 s.language, s.project, s.signature, s.file_mtime, s.layer,
+                s.parent_symbol_id, s.moniker,
                 i.depth, i.path, i.rel_type, i.confidence
             FROM impact i
             JOIN {schema}.symbols s ON s.id = i.symbol_id
@@ -402,7 +436,8 @@ impl GraphStore {
         let sql = format!(
             r#"
             SELECT id, name, symbol_type, file_path, start_line, end_line,
-                   language, project, signature, file_mtime, layer
+                   language, project, signature, file_mtime, layer,
+                   parent_symbol_id, moniker
             FROM {schema}.symbols
             WHERE (
                 name ILIKE $1
@@ -707,6 +742,8 @@ struct SymbolRow {
     signature: Option<String>,
     file_mtime: chrono::DateTime<chrono::Utc>,
     layer: Option<String>,
+    parent_symbol_id: Option<Uuid>,
+    moniker: Option<String>,
 }
 
 impl SymbolRow {
@@ -723,6 +760,8 @@ impl SymbolRow {
             signature: self.signature,
             file_mtime: self.file_mtime,
             layer: self.layer,
+            parent_symbol_id: self.parent_symbol_id,
+            moniker: self.moniker,
         }
     }
 }
@@ -740,6 +779,8 @@ struct ImpactRow {
     signature: Option<String>,
     file_mtime: chrono::DateTime<chrono::Utc>,
     layer: Option<String>,
+    parent_symbol_id: Option<Uuid>,
+    moniker: Option<String>,
     depth: i32,
     path: Vec<Uuid>,
     rel_type: String,
@@ -761,6 +802,8 @@ impl ImpactRow {
                 signature: self.signature,
                 file_mtime: self.file_mtime,
                 layer: self.layer,
+                parent_symbol_id: self.parent_symbol_id,
+                moniker: self.moniker,
             },
             depth: self.depth,
             path: self.path,

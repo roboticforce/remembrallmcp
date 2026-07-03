@@ -2,7 +2,7 @@
   "name": "remembrallmcp",
   "version": "0.3.1",
   "mcpName": "io.github.roboticforce/remembrallmcp",
-  "description": "Persistent knowledge memory layer for AI agents. Rust core, Postgres + pgvector backend, MCP protocol.",
+  "description": "Whole-codebase knowledge for AI coding agents. A field-aware code graph (functions, classes, methods, fields, and references across 8 languages) plus persistent memory. Rust core, Postgres + pgvector backend, MCP protocol.",
   "main": "index.js",
   "directories": {
     "doc": "docs",
@@ -15,7 +15,7 @@
     "type": "git",
     "url": "git+https://github.com/roboticforce/remembrallmcp.git"
   },
-  "keywords": ["mcp", "ai-agents", "memory", "knowledge-graph", "code-intelligence", "pgvector"],
+  "keywords": ["mcp", "ai-agents", "memory", "knowledge-graph", "code-intelligence", "code-graph", "field-references", "impact-analysis", "pgvector"],
   "author": "RobotICForce <contact@roboticforce.io> (https://roboticforce.io)",
   "license": "MIT",
   "type": "commonjs",

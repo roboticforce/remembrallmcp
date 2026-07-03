@@ -97,6 +97,36 @@ Release gate:
 - Any drop >5 points on a language dimension triggers investigation
 - Any impact-analysis regression on `must_find` relationships blocks merge
 
+### A2. Field-level reference correctness
+
+Question:
+"Does the graph capture data fields and resolve who reads them - the 'whole codebase' claim?"
+
+Owner:
+`crates/remembrall-test-harness` with `test-fixtures/field-capture.toml`
+
+Why it matters:
+Field-level capture is what makes the whole-codebase positioning truthful. ORM-heavy
+codebases live and die by "who references the `amount` field?" - a question symbol-only
+graphs cannot answer.
+
+Success metrics:
+
+- Field symbol recall: every class/struct data field in the fixture is captured as a `Field`
+  symbol with the right `parent_symbol_id`
+- `Defines` edge recall: class/struct -> field edges are all found
+- `References` edge recall/precision: self/receiver field reads (`self.x`, `this.x`, `&self.x`,
+  Go `s.X`, Ruby `@x`) resolve to the enclosing type's field
+- No-fan-out correctness: ambiguous cross-file field names are dropped, not fanned out
+  one-edge-per-candidate
+- Upstream impact on a field returns the methods that read it
+
+Release gate:
+
+- Any regression on field `References` recall blocks merge
+- A new supported language must ship a field-capture fixture case before it is claimed as
+  supported in the README
+
 ### B. Memory retrieval quality
 
 Question:

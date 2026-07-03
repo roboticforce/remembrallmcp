@@ -5,7 +5,7 @@
 //!   cargo run --bin parser_smoke -- /Users/steve/Dev/sugar/sugar sugarai
 //!   cargo run --bin parser_smoke -- /Users/steve/Dev/nomadsignal/src nomadsignal
 
-use remembrall_core::graph::types::SymbolType;
+use remembrall_core::graph::types::{RelationType, SymbolType};
 use remembrall_core::parser::index_directory;
 
 fn main() -> anyhow::Result<()> {
@@ -41,6 +41,16 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|s| s.symbol_type == SymbolType::Method)
         .collect();
+    let fields: Vec<_> = result
+        .symbols
+        .iter()
+        .filter(|s| s.symbol_type == SymbolType::Field)
+        .collect();
+    let references: Vec<_> = result
+        .relationships
+        .iter()
+        .filter(|r| r.rel_type == RelationType::References)
+        .collect();
 
     println!("=== Parser Smoke Test: {} ===", dir);
     println!(
@@ -48,14 +58,19 @@ fn main() -> anyhow::Result<()> {
         result.files_parsed, result.files_skipped
     );
     println!(
-        "Symbols: {} total  ({} files, {} functions, {} classes, {} methods)",
+        "Symbols: {} total  ({} files, {} functions, {} classes, {} methods, {} fields)",
         result.symbols.len(),
         files.len(),
         functions.len(),
         classes.len(),
         methods.len(),
+        fields.len(),
     );
-    println!("Relationships: {}", result.relationships.len());
+    println!(
+        "Relationships: {} total  ({} references)",
+        result.relationships.len(),
+        references.len(),
+    );
 
     println!("\n--- Functions (first 20) ---");
     for sym in functions.iter().take(20) {
@@ -75,6 +90,21 @@ fn main() -> anyhow::Result<()> {
     for sym in classes.iter().take(10) {
         println!(
             "  [{lang}] {name}  ({file}:{start})",
+            lang = sym.language,
+            name = sym.name,
+            file = sym.file_path,
+            start = sym.start_line.unwrap_or(0),
+        );
+    }
+
+    println!("\n--- Fields (first 20) ---");
+    for sym in fields.iter().take(20) {
+        let parent = sym
+            .parent_symbol_id
+            .map(|u| format!("{}", u))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  [{lang}] {name}  parent={parent}  ({file}:{start})",
             lang = sym.language,
             name = sym.name,
             file = sym.file_path,
