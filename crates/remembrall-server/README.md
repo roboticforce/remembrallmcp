@@ -1,6 +1,6 @@
 # remembrall-server
 
-MCP server for [RemembrallMCP](https://github.com/cdnsteve/remembrallmcp) - persistent knowledge memory and code dependency graph for AI agents.
+MCP server for [RemembrallMCP](https://github.com/roboticforce/remembrallmcp) - whole-codebase knowledge for AI coding agents. A field-aware code graph (functions, classes, methods, fields, references) plus persistent memory, built on Rust, Postgres + pgvector, exposed over MCP.
 
 ## MCP Tools
 
@@ -21,7 +21,7 @@ remembrall init
 # { "mcpServers": { "remembrall": { "command": "remembrall" } } }
 ```
 
-See the [full documentation](https://github.com/cdnsteve/remembrallmcp) for Docker Compose setup, benchmarks, and configuration.
+See the [full documentation](https://github.com/roboticforce/remembrallmcp) for Docker Compose setup, benchmarks, and configuration.
 
 ## License
 
