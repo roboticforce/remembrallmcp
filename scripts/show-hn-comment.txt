@@ -1,0 +1,29 @@
+I built this because I got tired of watching Claude Code re-explore the same codebase every session. On a 500-file project, the agent would spawn explore sub-agents, grep through directories, and read dozens of files just to answer "what calls UserService?" - burning 5,000-20,000 tokens on structure that doesn't change between sessions.
+
+RemembrallMCP is a Postgres-backed MCP server that gives agents two things:
+
+1. Persistent memory - decisions, patterns, and organizational knowledge indexed with hybrid semantic + full-text search (RRF fusion of pgvector cosine similarity and tsvector BM25). A contradiction detection pass runs at 0.75 similarity before storing, so you don't accumulate stale or conflicting knowledge.
+
+2. A live, field-aware code graph - built with tree-sitter (Rust bindings, 8 languages). Symbols are functions, classes, methods, and fields; edges are calls, imports, defines, inherits, and field references. So "who reads the amount field?" is a single query, not a grep. Two-phase resolution: collect all symbols first, then resolve cross-file imports, calls, and field references. Stored in Postgres with recursive CTEs for impact traversal. Confidence scores decay through call chains. "What breaks if I change AuthMiddleware?" returns in under 10ms regardless of codebase size.
+
+The embedding side uses fastembed (ONNX Runtime, all-MiniLM-L6-v2, 384-dim) running in-process. No OpenAI API calls, no external embedding service - the model downloads once (~23 MB) and runs locally. The whole thing is a single Rust binary.
+
+Benchmark on pallets/click (594 symbols, 1,589 relationships), 5 identical coding tasks run with and without:
+
+- Total tool calls: 112 without vs 5 with (-95.5%)
+- Estimated tokens: ~56,000 without vs ~1,000 with (-98.2%)
+- Memory recall: 31/31 ground truth queries, Recall@5 of 0.917, p95 latency 14ms
+
+The savings compound on larger codebases. Click is ~90 files. On a 500+ file monorepo, agents without RemembrallMCP need proportionally more exploration. Graph queries stay under 10ms because the structure is pre-indexed in Postgres, not discovered at runtime.
+
+Cold-start problem is real - a fresh instance knows nothing. Two ingestion tools solve this: remembrall_ingest_github shells to the gh CLI and bulk-imports merged PR descriptions (deduplicates by content fingerprint), and remembrall_ingest_docs walks a directory for markdown files and splits on H2 headers.
+
+MCP transport is stdio via rmcp. Works with Claude Code, Cursor, Codex, or any MCP-compatible client.
+
+GitHub: https://github.com/roboticforce/remembrallmcp
+crates.io: remembrall-server, remembrall-core
+
+Questions I'm genuinely curious about from this crowd:
+- Better approaches to cross-file import resolution in languages with dynamic imports (JavaScript is the most painful right now)
+- Whether anyone has done RRF vs learned fusion for this kind of hybrid retrieval
+- Thoughts on confidence decay models for call-chain impact analysis
