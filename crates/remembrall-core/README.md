@@ -1,6 +1,6 @@
 # remembrall-core
 
-Core library for [RemembrallMCP](https://github.com/cdnsteve/remembrallmcp) - persistent knowledge memory and code dependency graph for AI agents.
+Core library for [RemembrallMCP](https://github.com/roboticforce/remembrallmcp) - a field-aware code graph (functions, classes, methods, fields, references) plus persistent memory for AI agents.
 
 ## What's included
 

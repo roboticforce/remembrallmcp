@@ -1,6 +1,6 @@
 # RemembrallMCP
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg) [![Crates.io](https://img.shields.io/crates/v/remembrall-server.svg)](https://crates.io/crates/remembrall-server) [![CI](https://github.com/cdnsteve/remembrallmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/cdnsteve/remembrallmcp/actions/workflows/ci.yml) [![Docker](https://img.shields.io/docker/pulls/cdnsteve/remembrallmcp.svg)](https://hub.docker.com/r/cdnsteve/remembrallmcp)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg) [![Crates.io](https://img.shields.io/crates/v/remembrall-server.svg)](https://crates.io/crates/remembrall-server) [![CI](https://github.com/roboticforce/remembrallmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/roboticforce/remembrallmcp/actions/workflows/ci.yml) [![Docker](https://img.shields.io/docker/pulls/cdnsteve/remembrallmcp.svg)](https://hub.docker.com/r/cdnsteve/remembrallmcp)
 
 Whole-codebase knowledge for AI coding agents. A field-aware code graph plus persistent memory, built on Rust, Postgres + pgvector, and exposed over MCP.
 
@@ -84,7 +84,7 @@ For the broader benchmark strategy across memory retrieval, long-horizon memory,
 ### Option 1: Docker Compose (easiest)
 
 ```bash
-git clone https://github.com/cdnsteve/remembrallmcp.git
+git clone https://github.com/roboticforce/remembrallmcp.git
 cd remembrallmcp
 
 # Start Postgres + initialize schema + download embedding model
@@ -106,11 +106,11 @@ docker compose run --rm remembrall
 
 ```bash
 # macOS (Apple Silicon)
-curl -fsSL https://github.com/cdnsteve/remembrallmcp/releases/latest/download/remembrall-aarch64-apple-darwin.tar.gz | tar xz
+curl -fsSL https://github.com/roboticforce/remembrallmcp/releases/latest/download/remembrall-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv remembrall /usr/local/bin/
 
 # Linux (x86_64)
-curl -fsSL https://github.com/cdnsteve/remembrallmcp/releases/latest/download/remembrall-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -fsSL https://github.com/roboticforce/remembrallmcp/releases/latest/download/remembrall-x86_64-unknown-linux-gnu.tar.gz | tar xz
 sudo mv remembrall /usr/local/bin/
 
 # Initialize (sets up Postgres via Docker, creates schema, downloads model)

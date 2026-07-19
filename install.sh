@@ -4,7 +4,7 @@
 set -e
 
 INSTALL_DIR="${REMEMBRALL_INSTALL_DIR:-$HOME/.remembrall/bin}"
-REPO="cdnsteve/remembrallmcp"
+REPO="roboticforce/remembrallmcp"
 
 # Detect platform
 OS="$(uname -s)"

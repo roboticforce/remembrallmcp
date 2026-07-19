@@ -164,7 +164,7 @@ git checkout develop
 
 | Registry | Package | URL |
 |---|---|---|
-| GitHub | cdnsteve/remembrallmcp | https://github.com/cdnsteve/remembrallmcp |
+| GitHub | roboticforce/remembrallmcp | https://github.com/roboticforce/remembrallmcp |
 | crates.io | remembrall-core | https://crates.io/crates/remembrall-core |
 | crates.io | remembrall-server | https://crates.io/crates/remembrall-server |
 | npm | remembrallmcp | https://www.npmjs.com/package/remembrallmcp |

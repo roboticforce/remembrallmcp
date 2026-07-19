@@ -4,10 +4,10 @@ members = ["crates/remembrall-core", "crates/remembrall-server", "crates/remembr
 resolver = "3"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "MIT"
-description = "Persistent knowledge memory layer for AI agents - Rust, Postgres, pgvector"
+description = "Whole-codebase knowledge for AI coding agents - a field-aware code graph plus persistent memory, built on Rust, Postgres + pgvector, exposed over MCP"
 keywords = ["mcp", "ai", "memory", "knowledge-graph", "pgvector"]
 categories = ["development-tools", "database"]
 homepage = "https://roboticforce.io/remembrall"
