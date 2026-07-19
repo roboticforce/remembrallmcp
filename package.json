@@ -1,6 +1,6 @@
 {
   "name": "remembrallmcp",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "mcpName": "io.github.roboticforce/remembrallmcp",
   "description": "Whole-codebase knowledge for AI coding agents. A field-aware code graph (functions, classes, methods, fields, and references across 8 languages) plus persistent memory. Rust core, Postgres + pgvector backend, MCP protocol.",
   "main": "index.js",
