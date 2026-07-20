@@ -29,11 +29,12 @@ services:
     volumes:
       # Persists config (~/.remembrall/config.toml) and embedding model cache
       - remembrall_home:/home/remembrall
-    # MCP uses stdio - keep stdin open
+    # MCP uses stdio - keep stdin open so the server stays alive while idle
     stdin_open: true
     tty: true
-    # Run init on first launch to create schema and download embedding model
-    command: ["init", "--database-url", "postgres://postgres:postgres@db:5432/remembrall"]
+    # No command override: the image entrypoint runs `remembrall init`
+    # (idempotent schema + model setup) then `remembrall serve`, so the
+    # container stays running and `docker compose exec` works.
 
 volumes:
   db_data:

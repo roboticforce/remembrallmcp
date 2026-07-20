@@ -87,20 +87,19 @@ For the broader benchmark strategy across memory retrieval, long-horizon memory,
 git clone https://github.com/roboticforce/remembrallmcp.git
 cd remembrallmcp
 
-# Start Postgres + initialize schema + download embedding model
+# Start Postgres, initialize the schema, download the embedding model,
+# and run the MCP server. The remembrall container stays up after setup.
 docker compose up -d
 
-# Verify it's running
+# Verify it's running (database connected, schema ready)
 docker compose exec remembrall remembrall status
 ```
 
 That's it. Postgres with pgvector, the schema, and the embedding model are all set up automatically. The database and model cache persist across restarts.
 
-To run the MCP server:
+The `remembrall` container runs `remembrall init` (idempotent setup) followed by `remembrall serve` on startup, so it stays running and `docker compose exec` works for status, doctor, and other commands.
 
-```bash
-docker compose run --rm remembrall
-```
+To connect an MCP client (Claude Code, Cursor, Codex) to the server, see [Connect to your MCP client](#connect-to-your-mcp-client) below.
 
 ### Option 2: Download prebuilt binary
 
@@ -202,6 +201,8 @@ Add to your project's `.mcp.json` (works with Claude Code, Cursor, and any MCP-c
   }
 }
 ```
+
+Each invocation starts a fresh container, runs `remembrall init` (idempotent; its output goes to stderr so it never corrupts the MCP stream), then `remembrall serve` over stdio. The `-T` flag is required - it disables TTY allocation so JSON-RPC passes through cleanly. The `db` service starts automatically via `depends_on`.
 
 **If running from source (not installed to PATH):**
 
