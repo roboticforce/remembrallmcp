@@ -44,9 +44,15 @@ RUN useradd --uid 1001 --create-home --shell /sbin/nologin remembrall
 COPY --from=builder --chown=remembrall:remembrall \
     /build/target/release/remembrall /usr/local/bin/remembrall
 
+# Entrypoint runs `remembrall init` (idempotent setup) then hands off to the
+# MCP server. Keeps the container alive after setup so `docker compose exec`
+# works, and keeps stdout clean for MCP JSON-RPC.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 USER remembrall
 WORKDIR /home/remembrall
 
-ENTRYPOINT ["/usr/local/bin/remembrall"]
-# Default: no args = MCP server over stdio
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# Default: no args = entrypoint runs init, then `remembrall` (MCP server over stdio)
 CMD []

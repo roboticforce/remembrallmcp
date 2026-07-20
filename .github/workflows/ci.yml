@@ -14,3 +14,42 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --workspace
       - run: cargo test --workspace
+
+  # Runs the DB-backed integration test binary against a real Postgres+pgvector
+  # instance. `cargo test --workspace` does not cover this: the integration
+  # tests live in a `[[bin]]` target and need a database, so without this job
+  # the memory store, graph store, search, and impact analysis are untested in CI.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: remembrall
+        ports:
+          - 5450:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d remembrall"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5450/remembrall
+        run: cargo run --bin remembrall-integration-test
+
+  # Smoke-tests the Docker Compose setup path documented in the README quick
+  # start. Catches the class of regression from issue #6: a one-shot `init`
+  # command that exits the container, breaking `docker compose exec`, and init
+  # banner text leaking onto stdout where it corrupts the MCP JSON-RPC stream.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Docker smoke test
+        run: scripts/smoke-test-docker.sh
