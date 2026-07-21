@@ -71,7 +71,20 @@ jobs:
       - name: Publish remembrall-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p remembrall-core --no-verify || true
+        run: |
+          set +e
+          out="$(cargo publish -p remembrall-core --no-verify 2>&1)"
+          code=$?
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            # A re-run after a successful publish is not a failure (409 already exists).
+            # Any other error (missing token, build failure) must fail the job.
+            if echo "$out" | grep -qiE 'already exists|already (has been )?published|409 Conflict'; then
+              echo "::warning::remembrall-core already published; treating as success"
+              exit 0
+            fi
+            exit "$code"
+          fi
 
       - name: Wait for crates.io indexing
         run: sleep 30
@@ -79,7 +92,20 @@ jobs:
       - name: Publish remembrall-server
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p remembrall-server --no-verify || true
+        run: |
+          set +e
+          out="$(cargo publish -p remembrall-server --no-verify 2>&1)"
+          code=$?
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            # A re-run after a successful publish is not a failure (409 already exists).
+            # Any other error (missing token, build failure) must fail the job.
+            if echo "$out" | grep -qiE 'already exists|already (has been )?published|409 Conflict'; then
+              echo "::warning::remembrall-server already published; treating as success"
+              exit 0
+            fi
+            exit "$code"
+          fi
 
   publish-docker:
     needs: build
