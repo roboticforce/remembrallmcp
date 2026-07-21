@@ -7,12 +7,12 @@
     "url": "https://github.com/roboticforce/remembrallmcp",
     "source": "github"
   },
-  "version": "0.4.4",
+  "version": "0.4.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "remembrallmcp",
-      "version": "0.4.4",
+      "version": "0.4.5",
       "transport": {
         "type": "stdio"
       },
