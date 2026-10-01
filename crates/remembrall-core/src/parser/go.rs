@@ -44,7 +44,7 @@ pub fn parse_go_file(
 
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!("tree-sitter failed to parse {file_path}");
-        return FileParseResult::default();
+        return FileParseResult { had_errors: true, ..FileParseResult::default() };
     };
 
     let source_bytes = source.as_bytes();
@@ -94,6 +94,7 @@ pub fn parse_go_file(
     let mut cursor4 = root.walk();
     collect_type_annotations(&root, source_bytes, &mut ctx, &mut cursor4);
 
+    ctx.result.had_errors = root.has_error();
     ctx.result
 }
 

@@ -44,7 +44,7 @@ pub fn parse_kotlin_file(
 
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!("tree-sitter failed to parse {file_path}");
-        return FileParseResult::default();
+        return FileParseResult { had_errors: true, ..FileParseResult::default() };
     };
 
     let source_bytes = source.as_bytes();
@@ -90,6 +90,7 @@ pub fn parse_kotlin_file(
     // Pass 4: collect type annotations from function/method signatures.
     collect_type_annotations(&root, source_bytes, &mut ctx);
 
+    ctx.result.had_errors = root.has_error();
     ctx.result
 }
 

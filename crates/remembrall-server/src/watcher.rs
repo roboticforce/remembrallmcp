@@ -3,39 +3,25 @@
 //! Watches one or more project directories and incrementally updates the code
 //! graph when files are created, modified, or removed.
 //!
-//! Design decisions:
-//! - 500ms debounce: agents make bursty writes (save + format + lint). We wait
-//!   for the burst to settle before re-parsing.
-//! - Per-file incremental: only the changed file is re-parsed. The rest of the
-//!   graph is left intact.
-//! - Cross-file import resolution is skipped for watcher updates. Relationships
-//!   from the initial index remain correct; the watcher only refreshes symbols
-//!   and intra-file relationships for the touched file.
-//! - If a file fails to parse (e.g. syntax error mid-edit), we log and skip.
-//!   The stale symbols remain in the graph until the file is saved in a valid
-//!   state again.
+//! Change batches are coalesced by project, including events queued during a refresh.
+//! Each refresh re-resolves the entire project under the same database writer lock
+//! used by explicit indexing. This costs a full parse per batch but preserves incoming
+//! cross-file edges and publishes either the whole generation or none of it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use tokio::sync::mpsc;
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
+use notify::{EventKind, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
-use remembrall_core::graph::layers::detect_layer;
+use remembrall_core::graph::publication::refresh_project;
 use remembrall_core::graph::store::GraphStore;
-use remembrall_core::parser::{
-    parse_go_file, parse_java_file, parse_kotlin_file, parse_python_file, parse_ruby_file,
-    parse_rust_file, parse_ts_file, FileParseResult, TsLang,
-};
-
-/// Extensions we care about. All others are silently ignored.
-const WATCHED_EXTENSIONS: &[&str] = &[
-    "py", "ts", "tsx", "js", "jsx", "rs", "rb", "go", "java", "kt", "kts",
-];
+use remembrall_core::indexer::supported_extensions;
 
 /// Directories that are never meaningful source roots - changes inside them
 /// are discarded without touching the graph.
@@ -81,8 +67,27 @@ impl FileWatcher {
     ///
     /// This is additive - multiple directories can be registered. The actual
     /// OS-level watch is set up when [`run`] is called.
-    pub async fn add_project(&self, root: PathBuf, project: String) {
-        self.projects.lock().await.insert(root, project);
+    pub async fn add_project(&self, root: PathBuf, project: String) -> remembrall_core::error::Result<()> {
+        use remembrall_core::error::RemembrallError;
+        if project.trim().is_empty() || root.as_os_str().is_empty() {
+            return Err(RemembrallError::InvalidInput("watch root and project must not be empty".into()));
+        }
+        let root = root.canonicalize().map_err(|error|
+            RemembrallError::InvalidInput(format!("cannot resolve watch root: {error}")))?;
+        if !root.is_dir() {
+            return Err(RemembrallError::InvalidInput(format!("watch root '{}' is not a directory", root.display())));
+        }
+        let mut projects = self.projects.lock().await;
+        for (existing_root, existing_project) in projects.iter() {
+            if (existing_root == &root && existing_project != &project)
+                || (existing_project == &project && existing_root != &root) {
+                return Err(RemembrallError::InvalidInput(format!(
+                    "conflicting watcher ownership: '{}' belongs to '{}', cannot register '{}' as '{}'",
+                    existing_root.display(), existing_project, root.display(), project)));
+            }
+        }
+        projects.insert(root, project);
+        Ok(())
     }
 
     /// Start the event loop. Runs until the process exits or the future is
@@ -102,9 +107,11 @@ impl FileWatcher {
             return;
         }
 
-        // Channel between the notify callback thread and the tokio runtime.
-        // Buffer is generous: a large save burst can produce many events quickly.
-        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(256);
+        // A dirty set is bounded by registered projects, even during a slow parse.
+        // The single buffered token wakes the consumer without spawning queued tasks.
+        let pending = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pending_callback = Arc::clone(&pending);
+        let (tx, mut rx) = mpsc::channel::<()>(1);
 
         // Build the debounced watcher on a dedicated thread (notify requires
         // the watcher to stay alive on the thread that created it, or at least
@@ -116,29 +123,31 @@ impl FileWatcher {
         // duration of the process. The watcher itself uses OS-level APIs and
         // does not busy-loop.
         tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-
             let result = new_debouncer(
                 Duration::from_millis(500),
                 None,
-                move |res: DebounceEventResult| {
-                    match res {
-                        Ok(events) => {
-                            let paths: Vec<PathBuf> = events
-                                .into_iter()
-                                .flat_map(|e| e.event.paths)
-                                .collect();
-                            if !paths.is_empty() {
-                                let tx = tx_clone.clone();
-                                rt.spawn(async move {
-                                    let _ = tx.send(paths).await;
-                                });
+                move |res: DebounceEventResult| match res {
+                    Ok(events) => {
+                        let paths: Vec<PathBuf> = events
+                            .into_iter()
+                            .flat_map(|event| source_event_paths(event.event))
+                            .collect();
+                        let changed = changed_projects(&paths, &projects_snapshot);
+                        if !changed.is_empty() {
+                            match pending_callback.lock() {
+                                Ok(mut pending) => pending.extend(changed),
+                                Err(error) => {
+                                    tracing::error!("watcher pending set poisoned: {error}");
+                                    return;
+                                }
                             }
+                            // Full means a wake is already queued; the dirty set keeps all projects.
+                            let _ = tx_clone.try_send(());
                         }
-                        Err(errs) => {
-                            for e in errs {
-                                tracing::warn!("watcher error: {e:?}");
-                            }
+                    }
+                    Err(errs) => {
+                        for e in errs {
+                            tracing::warn!("watcher error: {e:?}");
                         }
                     }
                 },
@@ -170,27 +179,27 @@ impl FileWatcher {
         drop(tx);
 
         // Process incoming change batches on the tokio side.
-        while let Some(paths) = rx.recv().await {
-            // Deduplicate - a single burst can contain the same path many times.
-            let unique: HashSet<PathBuf> = paths.into_iter().collect();
-
-            for path in unique {
-                // Only process files with watched extensions that are not in
-                // ignored directories.
-                if !is_watched_file(&path) {
-                    continue;
+        while rx.recv().await.is_some() {
+            let roots = match pending.lock() {
+                Ok(mut pending) => std::mem::take(&mut *pending),
+                Err(error) => {
+                    tracing::error!("watcher pending set poisoned: {error}");
+                    break;
                 }
-
-                // Find which project this file belongs to.
-                let project = match find_project(&path, &projects_snapshot) {
-                    Some(p) => p,
-                    None => {
-                        tracing::debug!("change in unregistered path, skipping: {}", path.display());
-                        continue;
-                    }
-                };
-
-                reindex_file(&self.graph, &path, &project).await;
+            };
+            for (root, project) in roots {
+                match refresh_project(&self.graph, &root, &project).await {
+                    Ok(result) => tracing::info!(
+                        "refreshed {}: {} symbols, {} relationships",
+                        root.display(),
+                        result.symbols_stored,
+                        result.relationships_stored
+                    ),
+                    Err(error) => tracing::warn!(
+                        "refresh failed for {}; previous graph preserved: {error}",
+                        root.display()
+                    ),
+                }
             }
         }
 
@@ -202,166 +211,172 @@ impl FileWatcher {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Re-index a single changed file.
-///
-/// Removes the file's old symbols from the graph, re-parses the file, and
-/// inserts the new symbols. Errors are logged but do not propagate - a syntax
-/// error mid-edit should never crash the watcher.
-async fn reindex_file(graph: &Arc<GraphStore>, path: &Path, project: &str) {
-    let file_path = path.to_string_lossy().to_string();
-
-    // File was deleted.
-    if !path.exists() {
-        match graph.remove_file(&file_path, project).await {
-            Ok(removed) if removed > 0 => {
-                tracing::info!("removed {} symbols for deleted file: {}", removed, file_path);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("remove_file failed for {}: {e}", file_path);
-            }
-        }
-        return;
+/// Access notifications must not schedule another full parse when our parser reads files.
+fn source_event_paths(event: notify::Event) -> Vec<PathBuf> {
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return vec![];
     }
-
-    // Read source. If it fails (permissions, binary, etc.) log and skip.
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!("skipping {} - could not read: {e}", file_path);
-            return;
-        }
-    };
-
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let mtime = chrono::Utc::now();
-
-    // Parsers are synchronous/CPU-bound (tree-sitter). Run on a blocking thread
-    // to avoid stalling the tokio reactor.
-    let file_path_clone = file_path.clone();
-    let project_owned = project.to_string();
-    let parse_result: FileParseResult = match tokio::task::spawn_blocking(move || {
-        if ext == "py" {
-            parse_python_file(&file_path_clone, &source, &project_owned, mtime)
-        } else if ext == "rs" {
-            parse_rust_file(&file_path_clone, &source, &project_owned, mtime)
-        } else if ext == "rb" {
-            parse_ruby_file(&file_path_clone, &source, &project_owned, mtime)
-        } else if ext == "go" {
-            parse_go_file(&file_path_clone, &source, &project_owned, mtime)
-        } else if ext == "java" {
-            parse_java_file(&file_path_clone, &source, &project_owned, mtime)
-        } else if ext == "kt" || ext == "kts" {
-            parse_kotlin_file(&file_path_clone, &source, &project_owned, mtime)
-        } else if let Some(lang) = TsLang::from_extension(&ext) {
-            parse_ts_file(&file_path_clone, &source, &project_owned, mtime, lang)
-        } else {
-            FileParseResult::default()
-        }
-    })
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("parse panicked for {}: {e}", file_path);
-            return;
-        }
-    };
-
-    // If the extension was not matched, the result will be empty - skip.
-    if parse_result.symbols.is_empty() && parse_result.relationships.is_empty() {
-        return;
-    }
-
-    // Apply architectural layer detection to all symbols in this file.
-    // The walker does this in its phase-2b loop; we must do it here too so
-    // watcher-reindexed symbols get the same layer metadata as initial index.
-    let layer = detect_layer(&file_path);
-    let mut parse_result = parse_result;
-    for sym in &mut parse_result.symbols {
-        sym.layer = layer.clone();
-    }
-
-    // Remove stale symbols for this file before upserting fresh ones.
-    if let Err(e) = graph.remove_file(&file_path, project).await {
-        tracing::warn!("remove_file failed for {}: {e}", file_path);
-        return;
-    }
-
-    // Upsert new symbols.
-    let mut symbols_stored = 0u64;
-    for symbol in &parse_result.symbols {
-        match graph.upsert_symbol(symbol).await {
-            Ok(_) => symbols_stored += 1,
-            Err(e) => {
-                tracing::warn!("upsert_symbol failed for {} in {}: {e}", symbol.name, file_path);
-            }
-        }
-    }
-
-    // Store intra-file relationships. Cross-file relationships (to symbols in
-    // other files) are skipped here - they were resolved during the initial
-    // full index and remain valid unless those other files also changed.
-    let mut rels_stored = 0u64;
-    for rel in &parse_result.relationships {
-        match graph.add_relationship(rel).await {
-            Ok(_) => rels_stored += 1,
-            Err(e) => {
-                tracing::debug!("skipping relationship in {}: {e}", file_path);
-            }
-        }
-    }
-
-    tracing::info!(
-        "reindexed {} - {} symbols, {} relationships",
-        file_path,
-        symbols_stored,
-        rels_stored,
+    let directory_or_rename = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::Folder | CreateKind::Any)
+            | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any)
+            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any)
     );
+    event
+        .paths
+        .into_iter()
+        .filter(|path| directory_or_rename || path.is_dir() || has_source_extension(path))
+        .collect()
+}
+
+/// Include directory create/remove/rename events too: their children may have
+/// vanished before notification and therefore cannot be inspected individually.
+fn changed_projects(
+    paths: &[PathBuf],
+    projects: &HashMap<PathBuf, String>,
+) -> HashSet<(PathBuf, String)> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let (root, project) = find_project(path, projects)?;
+            // A checkout itself may live under .cursor/.codex. Exclusions are relative
+            // to its registered root, not to the user's home directory.
+            let relative = path.strip_prefix(&root).ok()?;
+            (!is_ignored_path(relative)).then_some((root, project))
+        })
+        .collect()
 }
 
 /// Return true if this file should be watched (has a supported extension and
 /// is not inside an ignored directory).
-fn is_watched_file(path: &Path) -> bool {
+fn has_source_extension(path: &Path) -> bool {
     // Must be a file path, not a directory.
     let ext = match path.extension().and_then(|e| e.to_str()) {
         Some(e) => e.to_lowercase(),
         None => return false,
     };
 
-    if !WATCHED_EXTENSIONS.contains(&ext.as_str()) {
-        return false;
-    }
+    supported_extensions().contains(&ext.as_str())
+}
 
+fn is_ignored_path(path: &Path) -> bool {
     // Check every component of the path against the ignore list.
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
             let name = name.to_string_lossy();
             if name.starts_with('.') && name != "." {
-                return false;
+                return true;
             }
             if IGNORE_DIRS.contains(&name.as_ref()) {
-                return false;
+                return true;
             }
         }
     }
 
-    true
+    false
 }
 
 /// Find the registered project for a given file path by longest-prefix match.
-fn find_project<'a>(
-    path: &Path,
-    projects: &'a HashMap<PathBuf, String>,
-) -> Option<String> {
+fn find_project(path: &Path, projects: &HashMap<PathBuf, String>) -> Option<(PathBuf, String)> {
     projects
         .iter()
         .filter(|(root, _)| path.starts_with(root))
         .max_by_key(|(root, _)| root.as_os_str().len())
-        .map(|(_, name)| name.clone())
+        .map(|(root, name)| (root.clone(), name.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batches_coalesce_by_longest_project_and_keep_directory_renames() {
+        let projects = HashMap::from([
+            (PathBuf::from("/repo"), "outer".to_string()),
+            (PathBuf::from("/repo/inner"), "inner".to_string()),
+        ]);
+        let changed = changed_projects(
+            &[
+                PathBuf::from("/repo/inner/a.ts"),
+                PathBuf::from("/repo/inner/b.ts"),
+                PathBuf::from("/repo/src.v2"),
+                PathBuf::from("/repo/node_modules/a.ts"),
+            ],
+            &projects,
+        );
+        assert_eq!(changed.len(), 2);
+        assert!(changed.contains(&(PathBuf::from("/repo/inner"), "inner".into())));
+        assert!(changed.contains(&(PathBuf::from("/repo"), "outer".into())));
+    }
+
+    #[test]
+    fn extension_filter_uses_authoritative_registry() {
+        for ext in supported_extensions() {
+            assert!(has_source_extension(&PathBuf::from(format!(
+                "/repo/example.{ext}"
+            ))));
+        }
+        assert!(is_ignored_path(Path::new("node_modules/x.ts")));
+        assert!(!has_source_extension(Path::new("/repo/image.png")));
+    }
+    #[test]
+    fn access_events_do_not_loop_and_hidden_parent_roots_work() {
+        use notify::event::{AccessKind, RenameMode};
+        let path = PathBuf::from("/home/.cursor/worktrees/repo/src.v2");
+        let access = notify::Event::new(EventKind::Access(AccessKind::Read)).add_path(path.clone());
+        assert!(source_event_paths(access).is_empty());
+        let rename = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(path.clone());
+        let paths = source_event_paths(rename);
+        assert_eq!(paths, vec![path]);
+        let projects = HashMap::from([(
+            PathBuf::from("/home/.cursor/worktrees/repo"),
+            "project".into(),
+        )]);
+        assert_eq!(changed_projects(&paths, &projects).len(), 1);
+    }
+    #[tokio::test]
+    async fn registration_rejects_project_collision_and_root_reassignment() {
+        // connect_lazy only constructs a pool; registration must never query a database.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused_test").unwrap();
+        let graph = Arc::new(GraphStore::new(pool, "watch_test".into()).unwrap());
+        let watcher = FileWatcher::new(graph);
+        let root = std::env::temp_dir().join(format!("watch-register-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        watcher.add_project(root.join("a"), "one".into()).await.unwrap();
+        watcher.add_project(root.join("a/../a"), "one".into()).await.unwrap();
+        assert!(watcher.add_project(root.join("b"), "one".into()).await.is_err());
+        assert!(watcher.add_project(root.join("a"), "two".into()).await.is_err());
+        watcher.add_project(root.join("b"), "two".into()).await.unwrap();
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(root.join("a"), root.join("alias")).unwrap();
+            watcher.add_project(root.join("alias"), "one".into()).await.unwrap();
+            assert!(watcher.add_project(root.join("alias"), "three".into()).await.is_err());
+        }
+        assert_eq!(watcher.projects.lock().await.len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_root_or_empty_name() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused_test").unwrap();
+        let graph = Arc::new(GraphStore::new(pool, "watch_test".into()).unwrap());
+        let watcher = FileWatcher::new(graph);
+        let root = std::env::temp_dir().join(format!("watch-invalid-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), "content").unwrap();
+        assert!(watcher.add_project(PathBuf::new(), "one".into()).await.is_err());
+        assert!(watcher.add_project(root.join("missing"), "one".into()).await.is_err());
+        assert!(watcher.add_project(root.join("file"), "one".into()).await.is_err());
+        assert!(watcher.add_project(root.clone(), " ".into()).await.is_err());
+        assert!(watcher.projects.lock().await.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

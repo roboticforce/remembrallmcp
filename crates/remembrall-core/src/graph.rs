@@ -1,4 +1,5 @@
 pub mod layers;
+pub mod publication;
 pub mod store;
 pub mod types;
 

@@ -16,7 +16,7 @@ use remembrall_core::{
         store::GraphStore,
         types::{Direction, SymbolType, TourStop},
     },
-    parser::index_directory,
+    graph::publication::refresh_project,
 };
 
 use crate::watcher;
@@ -76,34 +76,11 @@ pub async fn index_impl(
 ) -> Result<CallToolResult, McpError> {
     let IndexParams { path, project } = params;
 
-    let graph_arc = Arc::clone(graph);
-    let path_clone = path.clone();
-    let project_clone = project.clone();
-
-    let index_result = tokio::task::spawn_blocking(move || {
-        index_directory(&path_clone, &project_clone, None)
-    })
-    .await
-    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
-    .map_err(|e| McpError::internal_error(format!("index_directory failed: {e}"), None))?;
-
-    graph_arc
-        .remove_project(&project)
+    let index_result = refresh_project(graph, std::path::Path::new(&path), &project)
         .await
-        .map_err(|e| McpError::internal_error(format!("remove_project failed: {e}"), None))?;
-
-    graph_arc
-        .upsert_symbols_batch(&index_result.symbols)
-        .await
-        .map_err(|e| McpError::internal_error(format!("upsert_symbols_batch failed: {e}"), None))?;
-
-    graph_arc
-        .add_relationships_batch(&index_result.relationships)
-        .await
-        .map_err(|e| McpError::internal_error(format!("add_relationships_batch failed: {e}"), None))?;
-
-    let symbols_stored = index_result.symbols.len() as u64;
-    let relationships_stored = index_result.relationships.len() as u64;
+        .map_err(|e| McpError::internal_error(format!("project index failed: {e}"), None))?;
+    let symbols_stored = index_result.symbols_stored;
+    let relationships_stored = index_result.relationships_stored;
 
     let canonical = std::path::Path::new(&path)
         .canonicalize()
@@ -124,11 +101,12 @@ pub async fn index_impl(
         let project_name = project.clone();
         let watch_root = canonical.clone();
 
-        tokio::spawn(async move {
-            let fw = watcher::FileWatcher::new(watcher_graph);
-            fw.add_project(watch_root, project_name).await;
-            fw.run().await;
-        });
+        let fw = watcher::FileWatcher::new(watcher_graph);
+        if let Err(error) = fw.add_project(watch_root, project_name).await {
+            watched_dirs.lock().await.remove(&canonical);
+            return Err(McpError::internal_error(format!("graph indexed but watcher registration failed: {error}"), None));
+        }
+        tokio::spawn(async move { fw.run().await; });
 
         tracing::info!("background watcher started for {}", canonical.display());
     }

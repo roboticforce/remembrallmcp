@@ -6,20 +6,22 @@
 //!   cargo run --bin parser_smoke -- /Users/steve/Dev/nomadsignal/src nomadsignal
 
 use remembrall_core::graph::types::{RelationType, SymbolType};
-use remembrall_core::parser::index_directory;
+use remembrall_core::parser::{index_directory, index_directory_strict};
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let strict = args.iter().any(|arg| arg == "--strict");
+    args.retain(|arg| arg != "--strict");
     let (dir, project) = match args.len() {
         3 => (args[1].as_str(), args[2].as_str()),
         2 => (args[1].as_str(), "smoke"),
         _ => {
-            eprintln!("Usage: parser_smoke <directory> [project]");
+            eprintln!("Usage: parser_smoke [--strict] <directory> [project]");
             std::process::exit(1);
         }
     };
 
-    let result = index_directory(dir, project, None)?;
+    let result = if strict { index_directory_strict(dir, project)? } else { index_directory(dir, project, None)? };
 
     let files: Vec<_> = result
         .symbols

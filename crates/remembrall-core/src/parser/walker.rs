@@ -52,7 +52,17 @@ pub fn index_directory(
     project: &str,
     since: Option<DateTime<Utc>>,
 ) -> anyhow::Result<IndexResult> {
-    let root_dir = root_dir.as_ref();
+    index_directory_impl(root_dir.as_ref(), project, since, false)
+}
+
+/// Complete scan for atomic publication. Any unreadable or malformed source
+/// refuses replacement, preserving the previously published graph.
+pub fn index_directory_strict(root_dir: impl AsRef<Path>, project: &str) -> anyhow::Result<IndexResult> {
+    index_directory_impl(root_dir.as_ref(), project, None, true)
+}
+
+fn index_directory_impl(root_dir: &Path, project: &str, since: Option<DateTime<Utc>>, strict: bool) -> anyhow::Result<IndexResult> {
+    anyhow::ensure!(root_dir.is_dir(), "index root is not a directory: {}", root_dir.display());
     let mut result = IndexResult::default();
     // Collect all per-file results before resolving cross-file references.
     let mut file_results: Vec<FileParseResult> = Vec::new();
@@ -60,11 +70,12 @@ pub fn index_directory(
     for entry in WalkDir::new(root_dir)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !should_skip(e.path()))
+        .filter_entry(|e| e.depth() == 0 || !should_skip(e.path()))
     {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
+                if strict { return Err(err.into()); }
                 tracing::warn!("walkdir error: {err}");
                 continue;
             }
@@ -99,6 +110,7 @@ pub fn index_directory(
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(err) => {
+                if strict { return Err(anyhow::anyhow!("failed to read {}: {err}", path.display())); }
                 tracing::warn!("failed to read {}: {err}", path.display());
                 continue;
             }
@@ -111,11 +123,13 @@ pub fn index_directory(
         let file_result: FileParseResult = match parse_file(&ext, &file_path, &source, project, mtime) {
             Some(r) => r,
             None => {
+                if strict { anyhow::bail!("no parser for {}", path.display()); }
                 tracing::warn!("no parser for extension '{ext}' in {file_path}");
                 continue;
             }
         };
 
+        anyhow::ensure!(!strict || !file_result.had_errors, "parse errors in {}", path.display());
         result.files_parsed += 1;
         file_results.push(file_result);
     }
@@ -163,20 +177,109 @@ pub fn index_directory(
         }
     }
 
-    // Map: synthetic_v5_uuid -> Vec<real_uuid>  (for cross-file CALLS relationships)
-    //
-    // When multiple symbols share the same bare name (e.g., several `start` methods
-    // across different classes), we emit one Calls edge per candidate so that any
-    // comparator checking for a specific target can find it.
-    let mut synthetic_to_real: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    // Resolution is file-scoped. A bare name alone is never evidence of a
+    // project-wide call or type dependency, even when only one candidate exists.
+    let mut scoped_resolution: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
+    let mut local_types: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
     for fr in &file_results {
-        for s in &fr.symbols {
-            if matches!(
-                s.symbol_type,
-                SymbolType::Function | SymbolType::Method | SymbolType::Class | SymbolType::Field
-            ) {
-                let key = Uuid::new_v5(&Uuid::NAMESPACE_OID, s.name.as_bytes());
-                synthetic_to_real.entry(key).or_default().push(s.id);
+        let Some(file) = fr.symbols.first() else {
+            continue;
+        };
+        for symbol in &fr.symbols {
+            if symbol.symbol_type == SymbolType::Class
+                && fr.relationships.iter().any(|r| {
+                    r.rel_type == RelationType::Defines
+                        && r.source_id == file.id
+                        && r.target_id == symbol.id
+                })
+            {
+                local_types.insert(
+                    (
+                        file.id,
+                        Uuid::new_v5(&Uuid::NAMESPACE_OID, symbol.name.as_bytes()),
+                    ),
+                    symbol.id,
+                );
+            }
+        }
+        for binding in &fr.import_bindings {
+            let placeholder = Uuid::new_v5(&Uuid::NAMESPACE_OID, binding.module_raw.as_bytes());
+            let Some(target_file) = import_resolution.get(&(file.id, placeholder)) else {
+                continue;
+            };
+            let Some(target) = file_results
+                .iter()
+                .find(|r| r.symbols.first().map(|s| s.id) == Some(*target_file))
+            else {
+                continue;
+            };
+            let names: Vec<_> = if binding.imported_name == "*" {
+                target
+                    .exports
+                    .iter()
+                    .map(|(name, _)| (format!("{}.{}", binding.local_name, name), name.clone()))
+                    .collect()
+            } else {
+                vec![(binding.local_name.clone(), binding.imported_name.clone())]
+            };
+            for (local, imported) in names {
+                let candidates: Vec<_> = target
+                    .symbols
+                    .iter()
+                    .filter(|s| {
+                        (if matches!(
+                            s.language.as_str(),
+                            "typescript" | "tsx" | "javascript" | "jsx"
+                        ) {
+                            target
+                                .exports
+                                .iter()
+                                .any(|(name, id)| name == &imported && *id == s.id)
+                        } else {
+                            s.name == imported
+                        }) && target.relationships.iter().any(|r| {
+                            r.rel_type == RelationType::Defines
+                                && r.source_id == *target_file
+                                && r.target_id == s.id
+                        })
+                    })
+                    .collect();
+                if let [candidate] = candidates.as_slice() {
+                    scoped_resolution.insert(
+                        (
+                            file.id,
+                            Uuid::new_v5(&Uuid::NAMESPACE_OID, local.as_bytes()),
+                        ),
+                        candidate.id,
+                    );
+                    // Rust records impl method names as Type::method. An explicit
+                    // imported type grounds that prefix, including local aliases.
+                    if candidate.language == "rust" && candidate.symbol_type == SymbolType::Class {
+                        let prefix = format!("{}::", candidate.name);
+                        for method in &target.symbols {
+                            if method.symbol_type != SymbolType::Method {
+                                continue;
+                            }
+                            let Some(suffix) = method.name.strip_prefix(&prefix) else {
+                                continue;
+                            };
+                            if target.relationships.iter().any(|r| {
+                                r.rel_type == RelationType::Defines
+                                    && r.source_id == candidate.id
+                                    && r.target_id == method.id
+                            }) {
+                                let qualified = format!("{local}::{suffix}");
+                                scoped_resolution.insert(
+                                    (
+                                        file.id,
+                                        Uuid::new_v5(&Uuid::NAMESPACE_OID, qualified.as_bytes()),
+                                    ),
+                                    method.id,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -207,6 +310,7 @@ pub fn index_directory(
         .collect();
 
     for fr in file_results {
+        let file_id = fr.symbols.first().map(|s| s.id).unwrap_or_default();
         result.symbols.extend(fr.symbols);
 
         for rel in fr.relationships {
@@ -226,55 +330,15 @@ pub fn index_directory(
                 // this project and the graph store would reject the FK anyway.
                 // We still push it so callers can inspect it if desired.
                 result.relationships.push(rel);
-            } else if rel.rel_type == RelationType::Calls
-                || rel.rel_type == RelationType::UsesType
-            {
-                // For CALLS and USES_TYPE: when a synthetic target UUID maps to
-                // multiple real symbols (ambiguous name), emit one edge per candidate.
-                if let Some(real_ids) = synthetic_to_real.get(&rel.target_id) {
-                    let conf = rel.confidence / real_ids.len() as f32;
-                    for &real_id in real_ids {
-                        result.relationships.push(Relationship {
-                            source_id: rel.source_id,
-                            target_id: real_id,
-                            rel_type: rel.rel_type.clone(),
-                            confidence: conf,
-                        });
-                    }
-                } else {
-                    result.relationships.push(rel);
-                }
-            } else if rel.rel_type == RelationType::References {
-                // No-fan-out ambiguity policy for field references.
-                //
-                // Unlike Calls (which fan out one edge per same-named candidate),
-                // field references must NOT fan out: a common field name like
-                // `name` across 50 classes would create thousands of false edges
-                // (perf + correctness). Resolve a synthetic target only when it
-                // maps to exactly one real field; if ambiguous, drop the edge
-                // rather than guess. In-parser-resolved References (real v4 field
-                // UUIDs, the Phase 1 common case) are not in synthetic_to_real
-                // and pass through unchanged.
-                if let Some(real_ids) = synthetic_to_real.get(&rel.target_id) {
-                    if real_ids.len() == 1 {
-                        let mut rel = rel;
-                        rel.target_id = real_ids[0];
-                        rel.confidence = (rel.confidence * 0.8).min(1.0);
-                        result.relationships.push(rel);
-                    }
-                    // ambiguous (len > 1): drop the edge (no fan-out)
-                } else {
-                    // Already resolved in-parser to a real field UUID - keep as-is.
-                    result.relationships.push(rel);
-                }
             } else {
-                // For DEFINES, INHERITS: rewrite synthetic target UUIDs
-                // to real symbol UUIDs where possible (single match).
+                // Parser-resolved UUIDs pass through. Synthetic UUIDs are only
+                // rewritten through a lexical import binding from this file.
                 let mut rel = rel;
-                if let Some(real_ids) = synthetic_to_real.get(&rel.target_id) {
-                    if let Some(&first) = real_ids.first() {
-                        rel.target_id = first;
-                    }
+                if matches!(rel.rel_type, RelationType::UsesType | RelationType::Inherits) {
+                    if let Some(id) = local_types.get(&(file_id, rel.target_id)) { rel.target_id = *id; }
+                }
+                if let Some(id) = scoped_resolution.get(&(file_id, rel.target_id)) {
+                    rel.target_id = *id;
                 }
                 result.relationships.push(rel);
             }
@@ -436,27 +500,13 @@ fn resolve_rust_crate_import(
     // a deterministic result when both are in the map pointing to the same UUID.
     let mut current = slash_path;
     loop {
-        // Collect all matching stems for this candidate suffix, pick the SHORTEST one
-        // (closest to the crate root) to prefer root-level modules over nested ones
-        // with the same name (e.g., "src/assets.rs" over "src/bin/bat/assets.rs").
-        let best = path_stem_to_uuid
-            .iter()
-            .filter_map(|(file_stem, &uuid)| {
-                if !file_stem.ends_with(current) {
-                    return None;
-                }
-                let remainder = &file_stem[..file_stem.len() - current.len()];
-                if remainder.is_empty() || remainder.ends_with('/') {
-                    Some((file_stem.len(), uuid))
-                } else {
-                    None
-                }
-            })
-            .min_by_key(|(len, _)| *len);
-
-        if let Some((_, uuid)) = best {
-            return Some(uuid);
-        }
+        // Multiple files matching the same module suffix are ambiguous. Do not
+        // pick by iteration order or shortest path.
+        let matches: HashSet<_> = path_stem_to_uuid.iter().filter_map(|(stem, &id)| {
+            stem.strip_suffix(current).filter(|prefix| prefix.is_empty() || prefix.ends_with('/')).map(|_| id)
+        }).collect();
+        if matches.len() > 1 { return None; }
+        if let Some(id) = matches.into_iter().next() { return Some(id); }
 
         // Drop the last slash-separated segment and retry.
         if let Some(last_slash) = current.rfind('/') {
@@ -495,15 +545,11 @@ fn resolve_absolute_import(
 ) -> Option<Uuid> {
     let slash_path = module_path.replace('.', "/");
 
-    for (file_stem, &uuid) in path_stem_to_uuid {
-        if file_stem.ends_with(&slash_path) {
-            // Ensure we matched a complete path component boundary.
-            let remainder = &file_stem[..file_stem.len() - slash_path.len()];
-            if remainder.is_empty() || remainder.ends_with('/') {
-                return Some(uuid);
-            }
-        }
-    }
+    let matches: HashSet<_> = path_stem_to_uuid.iter().filter_map(|(stem, &id)| {
+        stem.strip_suffix(&slash_path).filter(|prefix| prefix.is_empty() || prefix.ends_with('/')).map(|_| id)
+    }).collect();
+    if matches.len() > 1 { return None; }
+    if let Some(id) = matches.into_iter().next() { return Some(id); }
 
     // Rust binary-crate-imports-library pattern: `bat/controller/Controller`
     // The first segment is the crate name.  Strip it and try to resolve the
@@ -524,9 +570,8 @@ fn resolve_absolute_import(
 ///
 /// Tries the stem as-is, then with common source extensions appended, and
 /// package index variants (`__init__.py`, `index.ts`, etc.).
-/// Falls back to scanning for any file under the stem directory when the
-/// import specifier points to a directory without an index file (e.g.,
-/// `./router/smart-router` -> `router/smart-router/router.ts`).
+/// Directory specifiers require a supported language entrypoint; arbitrary
+/// directory children are not inferred.
 fn try_path_variants(stem: &str, path_stem_to_uuid: &HashMap<String, Uuid>) -> Option<Uuid> {
     let candidates = [
         stem.to_string(),
@@ -554,33 +599,8 @@ fn try_path_variants(stem: &str, path_stem_to_uuid: &HashMap<String, Uuid>) -> O
         }
     }
 
-    // Fallback: if the stem looks like a directory (no extension in the last segment),
-    // scan for any file that lives directly under that directory.  This handles
-    // TypeScript packages where the entry point is not `index.ts` but named after the
-    // directory (e.g., `./router/smart-router` -> `router/smart-router/router.ts`).
-    let dir_prefix = format!("{stem}/");
-    let mut best: Option<(&str, &Uuid)> = None;
-    for (key, uuid) in path_stem_to_uuid {
-        if !key.starts_with(&dir_prefix) {
-            continue;
-        }
-        let after_prefix = &key[dir_prefix.len()..];
-        // Only match direct children (no further slashes in the remaining segment).
-        if after_prefix.contains('/') {
-            continue;
-        }
-        // Prefer shorter keys (closer to the directory root) and TypeScript files.
-        let is_better = match best {
-            None => true,
-            Some((prev_key, _)) => key.len() < prev_key.len(),
-        };
-        if is_better {
-            best = Some((key.as_str(), uuid));
-        }
-    }
-    if let Some((_, &uuid)) = best {
-        return Some(uuid);
-    }
+    // A directory without a language entrypoint is not evidence for selecting
+    // an arbitrary child module. Leave it unresolved.
 
     None
 }

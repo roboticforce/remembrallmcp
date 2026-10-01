@@ -1,25 +1,25 @@
-//! Incremental code indexer.
+//! Code indexer with atomic project snapshots.
 //!
-//! Walks a directory, compares file mtimes against the `file_index` table,
-//! and calls a [`CodeParser`] for each new or changed file. Deleted files are
-//! cleaned up from the graph store automatically.
+//! Walks a directory and compares mtimes for reporting, but parses the complete
+//! configured file set through [`CodeParser`] before atomically publishing graph
+//! and tracking rows. Errors preserve the previous complete snapshot.
 //!
 //! The indexer owns no parsing logic - it coordinates only. Swap the parser by
 //! providing a different [`CodeParser`] implementation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::info;
 use walkdir::WalkDir;
 
 use crate::config::validate_schema_name;
 use crate::error::{RemembrallError, Result};
-use crate::graph::types::{Relationship, Symbol};
 use crate::graph::GraphStore;
+use crate::graph::types::{Relationship, Symbol};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -60,7 +60,10 @@ pub struct IndexerConfig {
 impl IndexerConfig {
     /// All supported extensions. Uses [`supported_extensions`] as the source of truth.
     pub fn default_extensions() -> Vec<String> {
-        supported_extensions().iter().map(|s| (*s).to_string()).collect()
+        supported_extensions()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
     }
 
     /// Directories that almost never contain user code worth indexing.
@@ -121,10 +124,14 @@ pub struct Indexer {
 
 impl Indexer {
     pub fn new(pool: PgPool, schema: String, config: IndexerConfig) -> Result<Self> {
-        validate_schema_name(&schema)
-            .map_err(RemembrallError::InvalidInput)?;
+        validate_schema_name(&schema).map_err(RemembrallError::InvalidInput)?;
         let graph = GraphStore::new(pool.clone(), schema.clone())?;
-        Ok(Self { pool, graph, schema, config })
+        Ok(Self {
+            pool,
+            graph,
+            schema,
+            config,
+        })
     }
 
     /// Ensure the `file_index` tracking table exists.
@@ -150,60 +157,47 @@ impl Indexer {
         Ok(())
     }
 
-    /// Run a full incremental index of the configured root path.
-    ///
-    /// Steps:
-    /// 1. Walk the directory and collect candidate files with their disk mtimes.
-    /// 2. Load the previous mtime snapshot from `file_index`.
-    /// 3. Parse + store every new or changed file.
-    /// 4. Remove any file that was previously indexed but no longer exists.
+    /// Parse a complete configured snapshot under the project writer lock.
+    /// The custom parser contract is preserved. Mtimes report changed files but
+    /// no longer suppress parsing: fresh UUIDs require complete relationships.
     pub async fn run(&self, parser: &dyn CodeParser) -> Result<IndexStats> {
         let started = Instant::now();
-        let mut stats = IndexStats::default();
-
-        // --- Step 1: walk disk ---
+        let mut update = self
+            .graph
+            .begin_project_update(&self.config.project)
+            .await?;
         let disk_files = self.collect_files()?;
-        stats.files_scanned = disk_files.len() as u64;
-
-        // --- Step 2: load stored mtimes ---
-        let stored = self.load_stored_mtimes().await?;
-
-        // --- Step 3: index new/changed files ---
+        let stored = update.file_mtimes().await?;
+        let mut stats = IndexStats {
+            files_scanned: disk_files.len() as u64,
+            ..Default::default()
+        };
+        let mut symbols = Vec::new();
+        let mut relationships = Vec::new();
+        let mut mtimes = Vec::new();
         for (path, mtime) in &disk_files {
-            let path_str = path.to_string_lossy();
-            let needs_index = match stored.get(path_str.as_ref()) {
-                None => true,
-                Some(stored_mtime) => mtime != stored_mtime,
-            };
-
-            if !needs_index {
-                debug!("unchanged: {path_str}");
-                continue;
+            let path_str = path.to_string_lossy().into_owned();
+            if stored.get(&path_str) != Some(mtime) {
+                stats.files_changed += 1;
             }
-
-            stats.files_changed += 1;
-            match self.index_file(parser, path, *mtime, &mut stats).await {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!("Failed to index {path_str}: {e}");
-                }
-            }
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                RemembrallError::Internal(format!("read failed for {path_str}: {error}"))
+            })?;
+            let parsed = parser.parse(&path_str, &source, language_for_extension(path))?;
+            symbols.extend(parsed.symbols);
+            relationships.extend(parsed.relationships);
+            mtimes.push((path_str, *mtime));
         }
-
-        // --- Step 4: remove deleted files ---
-        let disk_set: HashSet<&str> =
-            disk_files.iter().map(|(p, _)| p.to_str().unwrap_or("")).collect();
-
-        for stored_path in stored.keys() {
-            if !disk_set.contains(stored_path.as_str()) {
-                info!("File deleted, removing from graph: {stored_path}");
-                let removed = self.graph.remove_file(stored_path, &self.config.project).await?;
-                self.delete_file_index_row(stored_path).await?;
-                stats.files_deleted += 1;
-                debug!("Removed {removed} symbols for {stored_path}");
-            }
-        }
-
+        let disk_set: HashSet<_> = mtimes.iter().map(|(path, _)| path).collect();
+        stats.files_deleted = stored
+            .keys()
+            .filter(|path| !disk_set.contains(path))
+            .count() as u64;
+        let counts = update
+            .replace_with_file_mtimes(&symbols, &relationships, &mtimes)
+            .await?;
+        stats.symbols_added = counts.symbols as u64;
+        stats.relationships_added = counts.relationships as u64;
         stats.elapsed_ms = started.elapsed().as_millis() as u64;
         info!("Index run complete: {stats}");
         Ok(stats)
@@ -216,9 +210,18 @@ impl Indexer {
     /// Walk the directory tree and return (absolute_path, mtime_utc) for every
     /// file whose extension matches the config.
     fn collect_files(&self) -> Result<Vec<(PathBuf, DateTime<Utc>)>> {
+        if !self.config.root_path.is_dir() {
+            return Err(RemembrallError::InvalidInput(
+                "index root must be an existing directory".into(),
+            ));
+        }
         let ext_set: HashSet<&str> = self.config.extensions.iter().map(|s| s.as_str()).collect();
-        let ignore_set: HashSet<&str> =
-            self.config.ignore_patterns.iter().map(|s| s.as_str()).collect();
+        let ignore_set: HashSet<&str> = self
+            .config
+            .ignore_patterns
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
 
         let mut files = Vec::new();
 
@@ -237,8 +240,7 @@ impl Indexer {
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
-                    warn!("walkdir error: {err}");
-                    continue;
+                    return Err(RemembrallError::Internal(format!("walkdir error: {err}")));
                 }
             };
 
@@ -257,112 +259,23 @@ impl Indexer {
             }
 
             // Read mtime from filesystem metadata.
-            let mtime = match entry.metadata() {
-                Ok(m) => system_time_to_utc(m.modified().map_err(|e| {
-                    RemembrallError::Internal(format!("mtime read error: {e}"))
-                })?)?,
-                Err(e) => {
-                    warn!("Cannot stat {}: {e}", entry.path().display());
-                    continue;
-                }
-            };
+            let mtime =
+                match entry.metadata() {
+                    Ok(m) => system_time_to_utc(m.modified().map_err(|e| {
+                        RemembrallError::Internal(format!("mtime read error: {e}"))
+                    })?)?,
+                    Err(e) => {
+                        return Err(RemembrallError::Internal(format!(
+                            "cannot stat {}: {e}",
+                            entry.path().display()
+                        )));
+                    }
+                };
 
             files.push((entry.into_path(), mtime));
         }
 
         Ok(files)
-    }
-
-    /// Load `(file_path -> mtime)` for the current project from `file_index`.
-    async fn load_stored_mtimes(&self) -> Result<HashMap<String, DateTime<Utc>>> {
-        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(&format!(
-            "SELECT file_path, mtime FROM {schema}.file_index WHERE project = $1",
-            schema = self.schema,
-        ))
-        .bind(&self.config.project)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().collect())
-    }
-
-    /// Parse one file and persist its symbols + relationships.
-    async fn index_file(
-        &self,
-        parser: &dyn CodeParser,
-        path: &Path,
-        mtime: DateTime<Utc>,
-        stats: &mut IndexStats,
-    ) -> Result<()> {
-        let path_str = path.to_string_lossy().into_owned();
-        let language = language_for_extension(path);
-
-        // Read source.
-        let source = std::fs::read_to_string(path).map_err(|e| {
-            RemembrallError::Internal(format!("read error for {path_str}: {e}"))
-        })?;
-
-        // Parse (synchronous, CPU-bound).
-        let parsed = parser.parse(&path_str, &source, language)?;
-
-        // Remove stale symbols for this file before inserting fresh ones.
-        // (This handles renames/deletions of individual symbols within the file.)
-        self.graph.remove_file(&path_str, &self.config.project).await?;
-
-        // Persist symbols.
-        for symbol in &parsed.symbols {
-            self.graph.upsert_symbol(symbol).await?;
-            stats.symbols_added += 1;
-        }
-
-        // Persist relationships.
-        for rel in &parsed.relationships {
-            self.graph.add_relationship(rel).await?;
-            stats.relationships_added += 1;
-        }
-
-        // Update tracking row.
-        self.upsert_file_index_row(&path_str, mtime).await?;
-
-        debug!(
-            "Indexed {path_str}: {} symbols, {} relationships",
-            parsed.symbols.len(),
-            parsed.relationships.len()
-        );
-        Ok(())
-    }
-
-    async fn upsert_file_index_row(&self, file_path: &str, mtime: DateTime<Utc>) -> Result<()> {
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {schema}.file_index (file_path, project, mtime, indexed_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (file_path, project) DO UPDATE SET
-                mtime      = EXCLUDED.mtime,
-                indexed_at = NOW()
-            "#,
-            schema = self.schema,
-        ))
-        .bind(file_path)
-        .bind(&self.config.project)
-        .bind(mtime)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    async fn delete_file_index_row(&self, file_path: &str) -> Result<()> {
-        sqlx::query(&format!(
-            "DELETE FROM {schema}.file_index WHERE file_path = $1 AND project = $2",
-            schema = self.schema,
-        ))
-        .bind(file_path)
-        .bind(&self.config.project)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
     }
 }
 
