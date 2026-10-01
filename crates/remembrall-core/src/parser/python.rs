@@ -39,6 +39,14 @@ pub struct RawImport {
     pub module_path: String,
 }
 
+/// A lexical import binding, retained separately from file import edges.
+#[derive(Debug, Clone)]
+pub struct ImportBinding {
+    pub local_name: String,
+    pub imported_name: String,
+    pub module_raw: String,
+}
+
 /// All symbols and relationships extracted from a single file.
 #[derive(Debug, Default)]
 pub struct FileParseResult {
@@ -46,6 +54,11 @@ pub struct FileParseResult {
     pub relationships: Vec<Relationship>,
     /// Unresolved imports - the walker resolves these after indexing all files.
     pub raw_imports: Vec<RawImport>,
+    /// Bindings with explicit source-module evidence (not a global name guess).
+    pub import_bindings: Vec<ImportBinding>,
+    pub exports: Vec<(String, Uuid)>,
+    /// Tree-sitter recovery was needed; unsafe for complete snapshot replacement.
+    pub had_errors: bool,
 }
 
 /// Parse a Python file and extract symbols and relationships.
@@ -67,7 +80,7 @@ pub fn parse_python_file(
 
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!("tree-sitter failed to parse {file_path}");
-        return FileParseResult::default();
+        return FileParseResult { had_errors: true, ..FileParseResult::default() };
     };
 
     let source_bytes = source.as_bytes();
@@ -122,6 +135,7 @@ pub fn parse_python_file(
     let mut cursor3 = root.walk();
     collect_calls(&root, source_bytes, &mut ctx, &mut cursor3);
 
+    ctx.result.had_errors = root.has_error();
     ctx.result
 }
 
@@ -335,6 +349,7 @@ fn process_import_from_statement(node: &Node<'_>, source: &[u8], ctx: &mut Parse
             {
                 let import_name = node_text(&child, source);
                 ctx.imported_names.insert(import_name.clone());
+                ctx.result.import_bindings.push(ImportBinding { local_name: import_name.clone(), imported_name: import_name.clone(), module_raw: raw_module.clone() });
                 // Emit UsesType from file -> imported symbol.
                 if !import_name.is_empty() && !is_builtin_type(&import_name) {
                     let target_id =
@@ -356,6 +371,10 @@ fn process_import_from_statement(node: &Node<'_>, source: &[u8], ctx: &mut Parse
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let import_name = node_text(&name_node, source);
                     ctx.imported_names.insert(import_name.clone());
+                    let alias = child.child_by_field_name("alias").map(|n| node_text(&n, source)).unwrap_or_else(|| import_name.clone());
+                    ctx.result.import_bindings.push(ImportBinding { local_name: alias, imported_name: import_name.clone(), module_raw: raw_module.clone() });
+                    // Preserve the imported-symbol UsesType emitted below.
+                    ctx.result.import_bindings.push(ImportBinding { local_name: import_name.clone(), imported_name: import_name.clone(), module_raw: raw_module.clone() });
                     if !import_name.is_empty() && !is_builtin_type(&import_name) {
                         let target_id =
                             Uuid::new_v5(&Uuid::NAMESPACE_OID, import_name.as_bytes());
@@ -929,7 +948,10 @@ fn process_call(node: &Node<'_>, source: &[u8], ctx: &mut ParseContext<'_>) {
     //   0.8 - method name matches an imported name
     //   0.6 - self.xxx.method() pattern: we know it's a method call but can't resolve the type
     //   0.5 - unresolved attribute call (obj.method() where obj is not self)
-    let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(&callee_name) {
+    let unknown_receiver = callee_kind == CalleeKind::Attribute || (callee_kind == CalleeKind::SelfChain && function_node.child_by_field_name("object").map(|n| node_text(&n, source) != "self").unwrap_or(true));
+    let (target_id, confidence) = if unknown_receiver {
+        (Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("{}:{}:{}", ctx.file_path, node.start_byte(), node_text(&function_node, source)).as_bytes()), 0.5)
+    } else if let Some(&id) = ctx.name_to_id.get(&callee_name) {
         // Defined in this file - high confidence.
         (id, 1.0_f32)
     } else if ctx.imported_names.contains(&callee_name) {

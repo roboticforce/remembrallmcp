@@ -48,7 +48,7 @@ pub fn parse_java_file(
 
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!("tree-sitter failed to parse {file_path}");
-        return FileParseResult::default();
+        return FileParseResult { had_errors: true, ..FileParseResult::default() };
     };
 
     let source_bytes = source.as_bytes();
@@ -101,6 +101,7 @@ pub fn parse_java_file(
     let mut cursor3 = root.walk();
     collect_calls(&root, source_bytes, &mut ctx, &mut cursor3);
 
+    ctx.result.had_errors = root.has_error();
     ctx.result
 }
 

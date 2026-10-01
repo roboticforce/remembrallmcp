@@ -1,9 +1,10 @@
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
+use std::collections::HashSet;
 use uuid::Uuid;
 
+use super::types::*;
 use crate::config::validate_schema_name;
 use crate::error::{RemembrallError, Result};
-use super::types::*;
 
 /// Code graph storage backed by Postgres adjacency tables + recursive CTEs.
 pub struct GraphStore {
@@ -13,9 +14,31 @@ pub struct GraphStore {
 
 impl GraphStore {
     pub fn new(pool: PgPool, schema: String) -> Result<Self> {
-        validate_schema_name(&schema)
-            .map_err(RemembrallError::InvalidInput)?;
+        validate_schema_name(&schema).map_err(RemembrallError::InvalidInput)?;
         Ok(Self { pool, schema })
+    }
+
+    /// Serialize all cooperating writers for this schema/project before reading source.
+    /// Transaction-scoped locks are released on commit, rollback, cancellation or disconnect.
+    pub async fn begin_project_update(&self, project: &str) -> Result<ProjectUpdate> {
+        let mut transaction = self.pool.begin().await?;
+        // Hash collisions only serialize unrelated projects; they cannot weaken isolation.
+        // Include a versioned namespace and schema so independent stores do not interfere.
+        let key = format!(
+            "remembrall:graph:v1:{}:{}:{}",
+            self.schema.len(),
+            self.schema,
+            project
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(key)
+            .execute(&mut *transaction)
+            .await?;
+        Ok(ProjectUpdate {
+            transaction,
+            schema: self.schema.clone(),
+            project: project.to_owned(),
+        })
     }
 
     /// Initialize graph tables.
@@ -726,6 +749,161 @@ impl GraphStore {
         .await?;
 
         Ok(result.rows_affected())
+    }
+}
+
+/// A project writer lease. Construct this before parsing, never after preparing a snapshot.
+/// Dropping the lease rolls back its transaction; readers continue to see the old graph.
+pub struct ProjectUpdate {
+    transaction: Transaction<'static, Postgres>,
+    schema: String,
+    project: String,
+}
+
+#[derive(Debug)]
+pub struct PublicationCounts {
+    pub symbols: usize,
+    pub relationships: usize,
+}
+
+impl ProjectUpdate {
+    /// Read legacy tracking metadata on the already-owned connection. Acquiring
+    /// another pool connection here can deadlock when all connections are writers.
+    pub async fn file_mtimes(
+        &mut self,
+    ) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>> {
+        let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(&format!(
+            "SELECT file_path, mtime FROM {}.file_index WHERE project = $1",
+            self.schema
+        ))
+        .bind(&self.project)
+        .fetch_all(&mut *self.transaction)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Replace one complete project generation and commit it atomically.
+    /// Unresolved parser placeholders are omitted; IDs from another project are never used.
+    pub async fn replace(
+        self,
+        symbols: &[Symbol],
+        relationships: &[Relationship],
+    ) -> Result<PublicationCounts> {
+        self.replace_snapshot(symbols, relationships, None).await
+    }
+
+    /// Also replace the legacy Indexer's tracking rows in the same transaction.
+    pub async fn replace_with_file_mtimes(
+        self,
+        symbols: &[Symbol],
+        relationships: &[Relationship],
+        mtimes: &[(String, chrono::DateTime<chrono::Utc>)],
+    ) -> Result<PublicationCounts> {
+        self.replace_snapshot(symbols, relationships, Some(mtimes))
+            .await
+    }
+
+    async fn replace_snapshot(
+        mut self,
+        symbols: &[Symbol],
+        relationships: &[Relationship],
+        mtimes: Option<&[(String, chrono::DateTime<chrono::Utc>)]>,
+    ) -> Result<PublicationCounts> {
+        let mut ids = HashSet::new();
+        for symbol in symbols {
+            if symbol.project != self.project || !ids.insert(symbol.id) {
+                return Err(RemembrallError::InvalidInput(
+                    "snapshot contains a foreign project or duplicate symbol ID".into(),
+                ));
+            }
+        }
+        if symbols
+            .iter()
+            .any(|symbol| symbol.parent_symbol_id.is_some_and(|id| !ids.contains(&id)))
+        {
+            return Err(RemembrallError::InvalidInput(
+                "snapshot contains an unknown parent symbol".into(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        let resolved: Vec<_> = relationships
+            .iter()
+            .filter(|rel| {
+                rel.source_id != rel.target_id
+                    && ids.contains(&rel.source_id)
+                    && ids.contains(&rel.target_id)
+                    && seen.insert((rel.source_id, rel.target_id, rel.rel_type.to_string()))
+            })
+            .collect();
+        sqlx::query(&format!(
+            "DELETE FROM {}.symbols WHERE project = $1",
+            self.schema
+        ))
+        .bind(&self.project)
+        .execute(&mut *self.transaction)
+        .await?;
+        for chunk in symbols.chunks(500) {
+            let mut query = QueryBuilder::<Postgres>::new(format!(
+                "INSERT INTO {}.symbols (id, name, symbol_type, file_path, start_line, end_line, language, project, signature, file_mtime, layer, parent_symbol_id, moniker) ",
+                self.schema
+            ));
+            query.push_values(chunk, |mut row, symbol| {
+                row.push_bind(symbol.id)
+                    .push_bind(&symbol.name)
+                    .push_bind(symbol.symbol_type.to_string())
+                    .push_bind(&symbol.file_path)
+                    .push_bind(symbol.start_line)
+                    .push_bind(symbol.end_line)
+                    .push_bind(&symbol.language)
+                    .push_bind(&symbol.project)
+                    .push_bind(&symbol.signature)
+                    .push_bind(symbol.file_mtime)
+                    .push_bind(&symbol.layer)
+                    .push_bind(symbol.parent_symbol_id)
+                    .push_bind(&symbol.moniker);
+            });
+            // No ON CONFLICT: an ID owned by another project must fail and roll back.
+            query.build().execute(&mut *self.transaction).await?;
+        }
+        for chunk in resolved.chunks(1000) {
+            let mut query = QueryBuilder::<Postgres>::new(format!(
+                "INSERT INTO {}.relationships (source_id, target_id, rel_type, confidence) ",
+                self.schema
+            ));
+            query.push_values(chunk, |mut row, rel| {
+                row.push_bind(rel.source_id)
+                    .push_bind(rel.target_id)
+                    .push_bind(rel.rel_type.to_string())
+                    .push_bind(rel.confidence);
+            });
+            query.build().execute(&mut *self.transaction).await?;
+        }
+        if let Some(mtimes) = mtimes {
+            sqlx::query(&format!(
+                "DELETE FROM {}.file_index WHERE project = $1",
+                self.schema
+            ))
+            .bind(&self.project)
+            .execute(&mut *self.transaction)
+            .await?;
+            for chunk in mtimes.chunks(1000) {
+                let mut query = QueryBuilder::<Postgres>::new(format!(
+                    "INSERT INTO {}.file_index (file_path, project, mtime) ",
+                    self.schema
+                ));
+                query.push_values(chunk, |mut row, (path, mtime)| {
+                    row.push_bind(path)
+                        .push_bind(&self.project)
+                        .push_bind(mtime);
+                });
+                query.build().execute(&mut *self.transaction).await?;
+            }
+        }
+        self.transaction.commit().await?;
+        Ok(PublicationCounts {
+            symbols: symbols.len(),
+            relationships: resolved.len(),
+        })
     }
 }
 

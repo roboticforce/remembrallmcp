@@ -43,7 +43,7 @@ pub use python::{parse_python_file, FileParseResult, RawImport};
 pub use ruby::parse_ruby_file;
 pub use rust::parse_rust_file;
 pub use typescript::{parse_ts_file, TsLang};
-pub use walker::{index_directory, IndexResult};
+pub use walker::{index_directory, index_directory_strict, IndexResult};
 
 use chrono::{DateTime, Utc};
 

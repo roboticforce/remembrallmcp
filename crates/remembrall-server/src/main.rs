@@ -596,6 +596,12 @@ async fn cmd_watch(paths: Vec<String>, project: Option<String>) -> Result<()> {
         .with_ansi(false)
         .init();
 
+    // Validate the whole replacement scope before connecting or publishing any graph.
+    let project_dirs = resolve_watch_projects(&paths, project.as_deref())?;
+    if project_dirs.len() > 1 && project.is_some() {
+        tracing::warn!("--project is ignored for multiple distinct roots; using directory basenames");
+    }
+
     let config = RemembrallConfig::load();
 
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -612,62 +618,23 @@ async fn cmd_watch(paths: Vec<String>, project: Option<String>) -> Result<()> {
     );
     graph.init().await?;
 
-    // Resolve each path to an absolute PathBuf and derive a project name.
-    let mut project_dirs: Vec<(std::path::PathBuf, String)> = Vec::new();
-    for (i, raw_path) in paths.iter().enumerate() {
-        let abs = std::path::Path::new(raw_path)
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("cannot resolve path '{}': {}", raw_path, e))?;
-
-        let name = if paths.len() == 1 {
-            // Single path: use --project override if given, else basename.
-            project
-                .clone()
-                .unwrap_or_else(|| basename(&abs))
-        } else {
-            // Multiple paths: ignore --project (ambiguous) and use basename of each.
-            if i == 0 && project.is_some() {
-                tracing::warn!("--project is ignored when multiple paths are specified; using directory basenames");
-            }
-            basename(&abs)
-        };
-
-        project_dirs.push((abs, name));
-    }
-
     // Initial full index of every registered project.
     for (root, proj) in &project_dirs {
         tracing::info!("initial index: {} (project={})", root.display(), proj);
-        let root_clone = root.clone();
-        let proj_clone = proj.clone();
-        let index_result = tokio::task::spawn_blocking(move || {
-            remembrall_core::parser::index_directory(&root_clone, &proj_clone, None)
-        })
-        .await??;
-
-        for symbol in &index_result.symbols {
-            if let Err(e) = graph.upsert_symbol(symbol).await {
-                tracing::warn!("upsert_symbol failed: {e}");
-            }
-        }
-        for rel in &index_result.relationships {
-            if let Err(e) = graph.add_relationship(rel).await {
-                tracing::debug!("skipping relationship: {e}");
-            }
-        }
+        let index_result = remembrall_core::graph::publication::refresh_project(&graph, root, proj).await?;
         tracing::info!(
             "indexed {} - {} files, {} symbols, {} relationships",
             root.display(),
             index_result.files_parsed,
-            index_result.symbols.len(),
-            index_result.relationships.len(),
+            index_result.symbols_stored,
+            index_result.relationships_stored,
         );
     }
 
     // Build the watcher and register all project directories.
     let fw = remembrall_server::watcher::FileWatcher::new(std::sync::Arc::clone(&graph));
     for (root, proj) in project_dirs {
-        fw.add_project(root, proj).await;
+        fw.add_project(root, proj).await?;
     }
 
     tracing::info!("watching for changes (press Ctrl+C to stop)");
@@ -676,6 +643,36 @@ async fn cmd_watch(paths: Vec<String>, project: Option<String>) -> Result<()> {
     fw.run().await;
 
     Ok(())
+}
+
+/// Resolve every requested root before performing any graph side effects.
+fn resolve_watch_projects(paths: &[String], project: Option<&str>) -> Result<Vec<(std::path::PathBuf, String)>> {
+    anyhow::ensure!(!paths.is_empty(), "watch requires at least one directory root");
+    if let Some(name) = project {
+        anyhow::ensure!(!name.trim().is_empty(), "project name must not be empty");
+    }
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in paths {
+        anyhow::ensure!(!raw.trim().is_empty(), "watch directory root must not be empty");
+        let root = std::path::Path::new(raw).canonicalize()
+            .map_err(|error| anyhow::anyhow!("cannot resolve watch root '{}': {}", raw, error))?;
+        anyhow::ensure!(root.is_dir(), "watch root '{}' is not a directory", root.display());
+        if seen.insert(root.clone()) { roots.push(root); }
+    }
+    let single = roots.len() == 1;
+    let mut owners = std::collections::HashMap::new();
+    let mut resolved = Vec::new();
+    for root in roots {
+        let name = if single { project.map(str::to_owned).unwrap_or_else(|| basename(&root)) }
+            else { basename(&root) };
+        anyhow::ensure!(!name.trim().is_empty(), "watch project name must not be empty");
+        if let Some(previous) = owners.insert(name.clone(), root.clone()) {
+            anyhow::bail!("watch project '{}' has conflicting roots '{}' and '{}'; run each root separately with distinct explicit --project names", name, previous.display(), root.display());
+        }
+        resolved.push((root, name));
+    }
+    Ok(resolved)
 }
 
 /// Return the last path component as a string, falling back to the full path.
@@ -702,4 +699,86 @@ fn cmd_version() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod watch_scope_tests {
+    use super::resolve_watch_projects;
+    use std::path::PathBuf;
+
+    struct Roots(PathBuf);
+    impl Roots {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("watch-scope-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn directory(&self, name: &str) -> String {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Roots {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn duplicate_basenames_refused_before_any_database_effects() {
+        let roots = Roots::new();
+        let a = roots.directory("a/src");
+        let b = roots.directory("b/src");
+        let error = resolve_watch_projects(&[a.clone(), b.clone()], None).unwrap_err().to_string();
+        assert!(error.contains("conflicting roots"));
+        assert!(error.contains("--project"));
+        assert!(error.contains("a/src") && error.contains("b/src"));
+        assert!(resolve_watch_projects(&[a, b], Some("ignored-for-multiple-roots")).is_err());
+    }
+
+    #[test]
+    fn distinct_roots_keep_distinct_projects() {
+        let roots = Roots::new();
+        let result = resolve_watch_projects(&[roots.directory("first"), roots.directory("second")], None).unwrap();
+        assert_eq!(result.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+    }
+
+    #[test]
+    fn repeated_canonical_root_deduplicated_and_explicit_name_preserved() {
+        let roots = Roots::new();
+        let path = roots.directory("source");
+        let result = resolve_watch_projects(&[path.clone(), format!("{path}/."), path], Some("explicit-owner")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, "explicit-owner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_is_one_canonical_root() {
+        let roots = Roots::new();
+        let path = roots.directory("source");
+        let alias = roots.0.join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let result = resolve_watch_projects(&[path, alias.to_string_lossy().into_owned()], None).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, "source");
+    }
+
+    #[test]
+    fn explicit_name_applies_to_single_root() {
+        let roots = Roots::new();
+        let result = resolve_watch_projects(&[roots.directory("src")], Some("service-a")).unwrap();
+        assert_eq!(result[0].1, "service-a");
+    }
+
+    #[test]
+    fn empty_missing_and_file_roots_are_refused() {
+        let roots = Roots::new();
+        let file = roots.0.join("file.ts");
+        std::fs::write(&file, "export const a = 1;").unwrap();
+        assert!(resolve_watch_projects(&[], None).is_err());
+        assert!(resolve_watch_projects(&["".into()], None).is_err());
+        assert!(resolve_watch_projects(&[roots.0.join("missing").to_string_lossy().into_owned()], None).is_err());
+        assert!(resolve_watch_projects(&[file.to_string_lossy().into_owned()], None).is_err());
+        assert!(resolve_watch_projects(&[roots.directory("valid")], Some(" ")).is_err());
+    }
 }

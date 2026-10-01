@@ -10,7 +10,7 @@ use tree_sitter::{Language, Node, Parser, TreeCursor};
 use uuid::Uuid;
 
 use crate::graph::types::{RelationType, Relationship, Symbol, SymbolType};
-use crate::parser::python::{FileParseResult, RawImport};
+use crate::parser::python::{FileParseResult, ImportBinding, RawImport};
 
 /// Language variant - determines grammar and file extension handling.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,7 +65,7 @@ pub fn parse_ts_file(
 
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!("tree-sitter failed to parse {file_path}");
-        return FileParseResult::default();
+        return FileParseResult { had_errors: true, ..FileParseResult::default() };
     };
 
     let source_bytes = source.as_bytes();
@@ -73,6 +73,7 @@ pub fn parse_ts_file(
 
     let mut ctx = TsParseContext {
         file_path,
+        source,
         project,
         file_mtime,
         lang_tag: lang.language_tag(),
@@ -108,10 +109,13 @@ pub fn parse_ts_file(
     let mut cursor2 = root.walk();
     collect_definitions(&root, file_symbol_id, None, source_bytes, &mut ctx, &mut cursor2);
 
+    collect_exports(&root, source_bytes, &mut ctx);
+
     // Third pass: collect calls.
     let mut cursor3 = root.walk();
     collect_calls(&root, source_bytes, &mut ctx, &mut cursor3);
 
+    ctx.result.had_errors = root.has_error();
     ctx.result
 }
 
@@ -120,6 +124,7 @@ pub fn parse_ts_file(
 // ---------------------------------------------------------------------------
 
 struct TsParseContext<'a> {
+    source: &'a str,
     file_path: &'a str,
     project: &'a str,
     file_mtime: DateTime<Utc>,
@@ -190,15 +195,16 @@ fn process_import_statement(node: &Node<'_>, source: &[u8], ctx: &mut TsParseCon
     // import_clause -> named_imports -> import_specifier -> name
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_import_clause_names(&child, source, ctx);
+        collect_import_clause_names(&child, source, ctx, &module_name);
     }
 }
 
-fn collect_import_clause_names(node: &Node<'_>, source: &[u8], ctx: &mut TsParseContext<'_>) {
+fn collect_import_clause_names(node: &Node<'_>, source: &[u8], ctx: &mut TsParseContext<'_>, module: &str) {
     match node.kind() {
         "identifier" => {
             // default import: `import Foo from 'bar'`
             ctx.imported_names.insert(node_text(node, source));
+            ctx.result.import_bindings.push(ImportBinding { local_name: node_text(node, source), imported_name: "default".into(), module_raw: module.into() });
         }
         "named_imports" => {
             let mut cursor = node.walk();
@@ -211,6 +217,11 @@ fn collect_import_clause_names(node: &Node<'_>, source: &[u8], ctx: &mut TsParse
                         .map(|n| node_text(&n, source))
                         .unwrap_or_default();
                     if !name.is_empty() {
+                        ctx.result.import_bindings.push(ImportBinding {
+                            local_name: name.clone(),
+                            imported_name: child.child_by_field_name("name").map(|n| node_text(&n, source)).unwrap_or_default(),
+                            module_raw: module.into(),
+                        });
                         ctx.imported_names.insert(name);
                     }
                 }
@@ -222,13 +233,14 @@ fn collect_import_clause_names(node: &Node<'_>, source: &[u8], ctx: &mut TsParse
             for child in node.named_children(&mut cursor) {
                 if child.kind() == "identifier" {
                     ctx.imported_names.insert(node_text(&child, source));
+                    ctx.result.import_bindings.push(ImportBinding { local_name: node_text(&child, source), imported_name: "*".into(), module_raw: module.into() });
                 }
             }
         }
         "import_clause" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect_import_clause_names(&child, source, ctx);
+                collect_import_clause_names(&child, source, ctx, module);
             }
         }
         _ => {}
@@ -928,24 +940,61 @@ fn process_call(node: &Node<'_>, source: &[u8], ctx: &mut TsParseContext<'_>) {
     let caller_id = find_enclosing_function(node, ctx);
     let source_id = caller_id.unwrap_or(ctx.result.symbols[0].id);
 
-    // Score confidence based on what we know about the callee.
-    //
-    // Confidence rules:
-    //   1.0 - method name matches a known symbol defined in this file
-    //   0.8 - method name matches an imported name
-    //   0.6 - this.xxx.method() pattern: instance method call, type not resolvable statically
-    //   0.5 - unresolved call (bare or non-this member expression)
-    let (target_id, confidence) = if ctx.name_to_id.contains_key(&callee_name) {
-        resolve_name(&callee_name, ctx)
-    } else if ctx.imported_names.contains(&callee_name) {
-        resolve_name(&callee_name, ctx)
-    } else if callee_kind == CalleeKind::ThisChain {
-        (
-            Uuid::new_v5(&Uuid::NAMESPACE_OID, callee_name.as_bytes()),
-            0.6_f32,
-        )
+    // Receiver syntax is evidence. An unknown receiver must never bind to a
+    // same-named method elsewhere, including elsewhere in this very file.
+    let object = function_node.child_by_field_name("object");
+    let direct_this = object.map(|n| n.kind() == "this").unwrap_or(false);
+    let target = if direct_this && lexical_this(node) {
+        find_enclosing_class(node, ctx)
+            .and_then(|class_id| unique_child(class_id, &callee_name, ctx))
+    } else if callee_kind == CalleeKind::Bare && !binding_shadows(node, &callee_name, source) {
+        lexical_callable(source_id, &callee_name, ctx)
     } else {
-        resolve_name(&callee_name, ctx)
+        None
+    };
+    let import_name =
+        if callee_kind == CalleeKind::Bare && !binding_shadows(node, &callee_name, source) {
+            ctx.result
+                .import_bindings
+                .iter()
+                .find(|b| b.local_name == callee_name && b.imported_name != "*")
+                .map(|_| callee_name.clone())
+        } else if let Some(object) = object.filter(|n| n.kind() == "identifier") {
+            let receiver = node_text(&object, source);
+            if !binding_shadows(node, &receiver, source)
+                && ctx
+                    .result
+                    .import_bindings
+                    .iter()
+                    .any(|b| b.local_name == receiver && b.imported_name == "*")
+            {
+                Some(format!("{receiver}.{callee_name}"))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let (target_id, confidence) = if let Some(id) = target {
+        (id, 1.0)
+    } else if let Some(name) = import_name {
+        (Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()), 0.8)
+    } else {
+        // Keep an inspectable unresolved edge, in a separate namespace so the
+        // walker cannot mistake it for a lexical import or a global bare name.
+        (
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!(
+                    "{}:{}:{}",
+                    ctx.file_path,
+                    node.start_byte(),
+                    node_text(&function_node, source)
+                )
+                .as_bytes(),
+            ),
+            0.5,
+        )
     };
 
     ctx.result.relationships.push(Relationship {
@@ -1013,51 +1062,267 @@ fn member_expression_starts_with_this(node: &Node<'_>, _source: &[u8]) -> bool {
 }
 
 fn find_enclosing_function(call_node: &Node<'_>, ctx: &TsParseContext<'_>) -> Option<Uuid> {
-    let call_start = call_node.start_position().row as i32 + 1;
-    let mut best: Option<(Uuid, i32)> = None; // (id, range_size)
-
-    for sym in &ctx.result.symbols {
-        if !matches!(sym.symbol_type, SymbolType::Function | SymbolType::Method) {
-            continue;
-        }
-        let (start, end) = match (sym.start_line, sym.end_line) {
-            (Some(s), Some(e)) => (s, e),
-            _ => continue,
-        };
-        if call_start >= start && call_start <= end {
-            let range = end - start;
-            let current_best = best.map(|(_, r)| r).unwrap_or(i32::MAX);
-            if range < current_best {
-                best = Some((sym.id, range));
-            }
-        }
-    }
-
-    best.map(|(id, _)| id)
+    enclosing_symbol(call_node, ctx, false)
 }
 
-/// Find the UUID of the innermost class symbol that contains `node`.
 fn find_enclosing_class(node: &Node<'_>, ctx: &TsParseContext<'_>) -> Option<Uuid> {
-    let target = node.start_position().row as i32 + 1;
-    let mut best: Option<(Uuid, i32)> = None; // (id, span)
+    enclosing_symbol(node, ctx, true)
+}
 
-    for sym in &ctx.result.symbols {
-        if sym.symbol_type != SymbolType::Class {
-            continue;
-        }
-        let (start, end) = match (sym.start_line, sym.end_line) {
-            (Some(s), Some(e)) => (s, e),
-            _ => continue,
+fn enclosing_symbol(node: &Node<'_>, ctx: &TsParseContext<'_>, class: bool) -> Option<Uuid> {
+    let mut ancestor = node.parent();
+    while let Some(n) = ancestor {
+        let is_kind = if class {
+            matches!(n.kind(), "class_declaration" | "abstract_class_declaration")
+        } else {
+            matches!(
+                n.kind(),
+                "function_declaration"
+                    | "generator_function_declaration"
+                    | "method_definition"
+                    | "arrow_function"
+                    | "function_expression"
+            )
         };
-        if target >= start && target <= end {
-            let range = end - start;
-            if range < best.map(|(_, r)| r).unwrap_or(i32::MAX) {
-                best = Some((sym.id, range));
+        if is_kind {
+            // Combine AST ancestor names with defining-class identity when
+            // several declarations occupy the same line.
+            let named = n.child_by_field_name("name").or_else(|| {
+                n.parent()
+                    .filter(|p| {
+                        matches!(p.kind(), "variable_declarator" | "public_field_definition")
+                    })
+                    .and_then(|p| p.child_by_field_name("name"))
+            });
+            let method_class = if n.kind() == "method_definition" {
+                find_enclosing_class(&n, ctx)
+            } else {
+                None
+            };
+            let candidates: Vec<_> = ctx
+                .result
+                .symbols
+                .iter()
+                .filter(|s| {
+                    method_class
+                        .map(|class_id| {
+                            ctx.result.relationships.iter().any(|r| {
+                                r.rel_type == RelationType::Defines
+                                    && r.source_id == class_id
+                                    && r.target_id == s.id
+                            })
+                        })
+                        .unwrap_or(true)
+                        && (if class {
+                            s.symbol_type == SymbolType::Class
+                        } else {
+                            matches!(s.symbol_type, SymbolType::Function | SymbolType::Method)
+                        })
+                        && s.start_line == Some(n.start_position().row as i32 + 1)
+                        && s.end_line == Some(n.end_position().row as i32 + 1)
+                        && named
+                            .map(|name| ctx.source.get(name.byte_range()) == Some(s.name.as_str()))
+                            .unwrap_or(true)
+                })
+                .collect();
+            if let [s] = candidates.as_slice() {
+                return Some(s.id);
+            }
+        }
+        ancestor = n.parent();
+    }
+    None
+}
+
+fn unique_child(parent: Uuid, name: &str, ctx: &TsParseContext<'_>) -> Option<Uuid> {
+    let mut candidates = ctx.result.symbols.iter().filter(|s| {
+        s.name == name
+            && matches!(
+                s.symbol_type,
+                SymbolType::Function | SymbolType::Method | SymbolType::Class
+            )
+            && ctx.result.relationships.iter().any(|r| {
+                r.rel_type == RelationType::Defines && r.source_id == parent && r.target_id == s.id
+            })
+    });
+    let id = candidates.next()?.id;
+    if candidates.next().is_some() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+fn lexical_callable(mut scope: Uuid, name: &str, ctx: &TsParseContext<'_>) -> Option<Uuid> {
+    loop {
+        let is_class = ctx
+            .result
+            .symbols
+            .iter()
+            .any(|s| s.id == scope && s.symbol_type == SymbolType::Class);
+        if !is_class {
+            if let Some(id) = unique_child(scope, name, ctx) {
+                return Some(id);
+            }
+        }
+        scope = ctx
+            .result
+            .relationships
+            .iter()
+            .find(|r| r.rel_type == RelationType::Defines && r.target_id == scope)?
+            .source_id;
+    }
+}
+
+fn binding_mentions(node: &Node<'_>, name: &str, source: &[u8]) -> bool {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => node_text(node, source) == name,
+        "pair_pattern" => node
+            .child_by_field_name("value")
+            .map(|n| binding_mentions(&n, name, source))
+            .unwrap_or(false),
+        "assignment_pattern" => node
+            .child_by_field_name("left")
+            .map(|n| binding_mentions(&n, name, source))
+            .unwrap_or(false),
+        "required_parameter" | "optional_parameter" => node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))
+            .map(|n| binding_mentions(&n, name, source))
+            .unwrap_or(false),
+        "object_pattern" | "array_pattern" | "rest_pattern" | "formal_parameters" => {
+            let mut c = node.walk();
+            let found = node
+                .named_children(&mut c)
+                .any(|n| binding_mentions(&n, name, source));
+            found
+        }
+        _ => false,
+    }
+}
+
+fn binding_shadows(node: &Node<'_>, name: &str, source: &[u8]) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(n) = ancestor {
+        if n.child_by_field_name("parameters")
+            .map(|p| binding_mentions(&p, name, source))
+            .unwrap_or(false)
+            || n.child_by_field_name("parameter")
+                .map(|p| binding_mentions(&p, name, source))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if matches!(
+            n.kind(),
+            "statement_block" | "program" | "for_statement" | "for_in_statement"
+        ) {
+            let mut c = n.walk();
+            for declaration in n
+                .named_children(&mut c)
+                .filter(|n| matches!(n.kind(), "lexical_declaration" | "variable_declaration"))
+            {
+                let mut c = declaration.walk();
+                for binding in declaration.named_children(&mut c) {
+                    if binding
+                        .child_by_field_name("name")
+                        .map(|p| binding_mentions(&p, name, source))
+                        .unwrap_or(false)
+                    {
+                        // An arrow/function definition has its own graph symbol;
+                        // other bindings shadow an import without a known target.
+                        let callable = binding
+                            .child_by_field_name("value")
+                            .map(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
+                            .unwrap_or(false);
+                        if !callable {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        ancestor = n.parent();
+    }
+    false
+}
+
+fn lexical_this(node: &Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(n) = ancestor {
+        match n.kind() {
+            "method_definition" => return true,
+            "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function" => return false,
+            "class_declaration" | "abstract_class_declaration" => return true,
+            _ => {}
+        }
+        ancestor = n.parent();
+    }
+    false
+}
+
+fn collect_exports(root: &Node<'_>, source: &[u8], ctx: &mut TsParseContext<'_>) {
+    let mut cursor = root.walk();
+    for statement in root
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "export_statement")
+    {
+        if statement.child_by_field_name("source").is_some() {
+            continue;
+        } // re-export traversal is not inferred
+        let text = node_text(&statement, source);
+        let default = text.starts_with("export default ");
+        let declaration = statement
+            .child_by_field_name("declaration")
+            .or_else(|| statement.child_by_field_name("value"));
+        let mut names = Vec::new();
+        if let Some(declaration) = declaration {
+            if let Some(name) = declaration.child_by_field_name("name") {
+                names.push(node_text(&name, source));
+            }
+            if declaration.kind() == "identifier" {
+                names.push(node_text(&declaration, source));
+            }
+            let mut c = declaration.walk();
+            for child in declaration
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "variable_declarator")
+            {
+                if let Some(name) = child.child_by_field_name("name") {
+                    names.push(node_text(&name, source));
+                }
+            }
+        }
+        let mut c = statement.walk();
+        for clause in statement
+            .named_children(&mut c)
+            .filter(|n| n.kind() == "export_clause")
+        {
+            let mut c = clause.walk();
+            for spec in clause.named_children(&mut c) {
+                if let Some(name) = spec.child_by_field_name("name") {
+                    let local = node_text(&name, source);
+                    let exported = spec
+                        .child_by_field_name("alias")
+                        .map(|n| node_text(&n, source))
+                        .unwrap_or_else(|| local.clone());
+                    if let Some(id) = unique_child(ctx.result.symbols[0].id, &local, ctx) {
+                        ctx.result.exports.push((exported, id));
+                    }
+                }
+            }
+        }
+        for name in names {
+            if let Some(id) = unique_child(ctx.result.symbols[0].id, &name, ctx) {
+                ctx.result
+                    .exports
+                    .push((if default { "default".into() } else { name }, id));
             }
         }
     }
-
-    best.map(|(id, _)| id)
 }
 
 /// Capture a non-function class field as a `Field` symbol with a `Defines` edge
@@ -1311,13 +1576,8 @@ fn extract_type_identifiers(node: &Node<'_>, source: &[u8], out: &mut Vec<String
             }
         }
         "nested_type_identifier" => {
-            // `a.B` - only take the member (right-hand) identifier.
-            if let Some(member) = node.child_by_field_name("member") {
-                let name = node_text(&member, source);
-                if !name.is_empty() {
-                    out.push(name);
-                }
-            }
+            // Retain namespace evidence instead of reducing `a.B` to bare B.
+            out.push(node_text(node, source));
         }
         "generic_type" => {
             // Push the base type name, then recurse into the type arguments.

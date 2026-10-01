@@ -25,7 +25,7 @@ use tree_sitter::{Node, Parser, TreeCursor};
 use uuid::Uuid;
 
 use crate::graph::types::{RelationType, Relationship, Symbol, SymbolType};
-use crate::parser::python::{FileParseResult, RawImport};
+use crate::parser::python::{FileParseResult, ImportBinding, RawImport};
 
 /// Parse a Rust file and extract symbols and relationships.
 ///
@@ -46,7 +46,7 @@ pub fn parse_rust_file(
 
     let Some(tree) = parser.parse(source, None) else {
         tracing::warn!("tree-sitter failed to parse {file_path}");
-        return FileParseResult::default();
+        return FileParseResult { had_errors: true, ..FileParseResult::default() };
     };
 
     let source_bytes = source.as_bytes();
@@ -92,6 +92,7 @@ pub fn parse_rust_file(
     let mut cursor3 = root.walk();
     collect_calls(&root, source_bytes, &mut ctx, &mut cursor3);
 
+    ctx.result.had_errors = root.has_error();
     ctx.result
 }
 
@@ -173,7 +174,8 @@ fn process_use_declaration(node: &Node<'_>, source: &[u8], ctx: &mut ParseContex
 
     let file_id = ctx.result.symbols[0].id;
 
-    for raw_path in paths {
+    for raw_with_alias in paths {
+        let (raw_path, alias) = raw_with_alias.split_once(" as ").map(|(p, a)| (p.to_string(), Some(a.to_string()))).unwrap_or((raw_with_alias, None));
         if raw_path.is_empty() {
             continue;
         }
@@ -182,7 +184,9 @@ fn process_use_declaration(node: &Node<'_>, source: &[u8], ctx: &mut ParseContex
         if let Some(last) = raw_path.split("::").last() {
             let name = last.trim_end_matches('*');
             if !name.is_empty() && name != "{" {
-                ctx.imported_names.insert(name.to_string());
+                let local = alias.clone().unwrap_or_else(|| name.to_string());
+                ctx.imported_names.insert(local.clone());
+                ctx.result.import_bindings.push(ImportBinding { local_name: local, imported_name: name.to_string(), module_raw: raw_path.clone() });
             }
         }
 
@@ -268,7 +272,8 @@ fn collect_use_tree_paths(node: &Node<'_>, source: &[u8], paths: &mut Vec<String
                 .child_by_field_name("path")
                 .map(|n| node_text(&n, source))
                 .unwrap_or_else(|| node_text(node, source));
-            paths.push(path);
+            let alias = node.child_by_field_name("alias").map(|n| node_text(&n, source));
+            paths.push(alias.map(|a| format!("{path} as {a}")).unwrap_or(path));
         }
         _ => {
             // Fallback: just grab the text.
@@ -963,7 +968,10 @@ fn process_call(
         .next()
         .unwrap_or("")
         .to_string();
-    let (target_id, confidence) = if let Some(&id) = ctx.name_to_id.get(&callee_name) {
+    let unknown_receiver = function_node.kind() == "field_expression" && callee_kind != CalleeKind::SelfChain && !callee_name.contains("::");
+    let (target_id, confidence) = if unknown_receiver {
+        (Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("{}:{}:{}", ctx.file_path, node.start_byte(), node_text(&function_node, source)).as_bytes()), 0.5)
+    } else if let Some(&id) = ctx.name_to_id.get(&callee_name) {
         (id, 1.0_f32)
     } else if ctx.imported_names.contains(&callee_name)
         || (!callee_type_prefix.is_empty() && ctx.imported_names.contains(&callee_type_prefix))
